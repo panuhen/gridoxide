@@ -18,8 +18,8 @@ use crate::command::{Command, CommandBus, CommandSender, CommandSource};
 use crate::event::EventLog;
 use crate::synth::ParamId;
 use crate::ui::{
-    get_param_value, render_grid, render_params, render_transport, GridState, ParamEditorState,
-    Theme,
+    get_param_value, render_grid, render_mixer, render_params, render_transport, GridState,
+    MixerField, MixerState, ParamEditorState, Theme,
 };
 
 /// Current UI view
@@ -27,6 +27,7 @@ use crate::ui::{
 pub enum View {
     Grid,
     Params,
+    Mixer,
 }
 
 /// Application state
@@ -45,6 +46,8 @@ pub struct App {
     grid_state: GridState,
     /// Parameter editor state
     param_editor: ParamEditorState,
+    /// Mixer state
+    mixer_state: MixerState,
     /// Current view
     view: View,
     /// Whether the app should quit
@@ -74,6 +77,7 @@ impl App {
             sequencer_state,
             grid_state: GridState::new(),
             param_editor: ParamEditorState::new(),
+            mixer_state: MixerState::new(),
             view: View::Grid,
             should_quit: false,
         })
@@ -159,6 +163,7 @@ impl App {
         match self.view {
             View::Grid => self.handle_grid_key(key),
             View::Params => self.handle_params_key(key),
+            View::Mixer => self.handle_mixer_key(key),
         }
     }
 
@@ -247,8 +252,11 @@ impl App {
                 self.should_quit = true;
             }
 
-            // Back to grid
-            KeyCode::Tab | KeyCode::Esc => {
+            // Cycle to mixer view (Esc goes back to grid)
+            KeyCode::Tab => {
+                self.view = View::Mixer;
+            }
+            KeyCode::Esc => {
                 self.view = View::Grid;
             }
 
@@ -297,6 +305,97 @@ impl App {
             }
 
             _ => {}
+        }
+    }
+
+    /// Handle keys in mixer view
+    fn handle_mixer_key(&mut self, key: KeyCode) {
+        match key {
+            // Quit
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+            }
+
+            // Cycle to grid view (Esc also goes back to grid)
+            KeyCode::Tab | KeyCode::Esc => {
+                self.view = View::Grid;
+            }
+
+            // Select track
+            KeyCode::Char('1') => self.mixer_state.select_track(0),
+            KeyCode::Char('2') => self.mixer_state.select_track(1),
+            KeyCode::Char('3') => self.mixer_state.select_track(2),
+            KeyCode::Char('4') => self.mixer_state.select_track(3),
+
+            // Navigate fields
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.mixer_state.move_field(-1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.mixer_state.move_field(1);
+            }
+
+            // Adjust value or toggle
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.adjust_mixer_value(-1);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.adjust_mixer_value(1);
+            }
+
+            // Toggle mute on selected track
+            KeyCode::Char('m') => {
+                self.dispatch(Command::ToggleMute(self.mixer_state.selected_track));
+            }
+
+            // Toggle solo on selected track
+            KeyCode::Char('o') => {
+                self.dispatch(Command::ToggleSolo(self.mixer_state.selected_track));
+            }
+
+            // Play/Stop
+            KeyCode::Char('p') => {
+                let playing = self.sequencer_state.read().playing;
+                if playing {
+                    self.dispatch(Command::Stop);
+                } else {
+                    self.dispatch(Command::Play);
+                }
+            }
+            KeyCode::Char('s') => {
+                self.dispatch(Command::Stop);
+            }
+
+            _ => {}
+        }
+    }
+
+    /// Adjust a mixer value based on current field selection
+    fn adjust_mixer_value(&mut self, direction: i32) {
+        let track = self.mixer_state.selected_track;
+        match self.mixer_state.selected_field {
+            MixerField::Volume => {
+                let current = self.sequencer_state.read().track_volumes[track];
+                let new_vol = (current + direction as f32 * 0.05).clamp(0.0, 1.0);
+                self.dispatch(Command::SetTrackVolume {
+                    track,
+                    volume: new_vol,
+                });
+            }
+            MixerField::Pan => {
+                let current = self.sequencer_state.read().track_pans[track];
+                let new_pan = (current + direction as f32 * 0.1).clamp(-1.0, 1.0);
+                self.dispatch(Command::SetTrackPan {
+                    track,
+                    pan: new_pan,
+                });
+            }
+            MixerField::Mute => {
+                self.dispatch(Command::ToggleMute(track));
+            }
+            MixerField::Solo => {
+                self.dispatch(Command::ToggleSolo(track));
+            }
         }
     }
 
@@ -367,6 +466,9 @@ impl App {
             View::Params => {
                 render_params(frame, chunks[2], &state, &self.param_editor, &self.theme);
             }
+            View::Mixer => {
+                render_mixer(frame, chunks[2], &state, &self.mixer_state, &self.theme);
+            }
         }
 
         self.render_footer(frame, chunks[3]);
@@ -377,6 +479,7 @@ impl App {
         let view_indicator = match self.view {
             View::Grid => "[GRID]",
             View::Params => "[PARAMS]",
+            View::Mixer => "[MIXER]",
         };
         let title = format!(
             " GRIDOXIDE v{} {} ",
@@ -408,7 +511,11 @@ impl App {
                 self.theme.name
             ),
             View::Params => format!(
-                "1-4:Track | Up/Down:Select | Left/Right:Adjust | [/]:Coarse | TAB:Grid | Q:Quit | {}",
+                "1-4:Track | Up/Down:Select | Left/Right:Adjust | [/]:Coarse | TAB:Mixer | Q:Quit | {}",
+                self.theme.name
+            ),
+            View::Mixer => format!(
+                "1-4:Track | Up/Down:Field | Left/Right:Adjust | M:Mute | O:Solo | TAB:Grid | Q:Quit | {}",
                 self.theme.name
             ),
         };

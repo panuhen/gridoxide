@@ -24,6 +24,11 @@ pub struct SequencerState {
     pub snare_params: SnareParams,
     pub hihat_params: HiHatParams,
     pub bass_params: BassParams,
+    // Mixer state
+    pub track_volumes: [f32; 4],
+    pub track_pans: [f32; 4],
+    pub track_mutes: [bool; 4],
+    pub track_solos: [bool; 4],
 }
 
 impl SequencerState {
@@ -37,6 +42,10 @@ impl SequencerState {
             snare_params: SnareParams::default(),
             hihat_params: HiHatParams::default(),
             bass_params: BassParams::default(),
+            track_volumes: [0.8; 4],
+            track_pans: [0.0; 4],
+            track_mutes: [false; 4],
+            track_solos: [false; 4],
         }
     }
 }
@@ -109,6 +118,12 @@ impl AudioEngine {
 
         // Local pattern copy (synced periodically from shared state)
         let mut pattern = Pattern::new();
+
+        // Local mixer state
+        let mut local_volumes = [0.8f32; 4];
+        let mut local_pans = [0.0f32; 4];
+        let mut local_mutes = [false; 4];
+        let mut local_solos = [false; 4];
 
         // For periodic state sync
         let mut sync_counter = 0usize;
@@ -192,6 +207,40 @@ impl AudioEngine {
                                 update_state_param(&mut state, param, value);
                             }
                         }
+                        Command::SetTrackVolume { track, volume } => {
+                            if track < 4 {
+                                let v = volume.clamp(0.0, 1.0);
+                                local_volumes[track] = v;
+                                if let Some(mut state) = state.try_write() {
+                                    state.track_volumes[track] = v;
+                                }
+                            }
+                        }
+                        Command::SetTrackPan { track, pan } => {
+                            if track < 4 {
+                                let p = pan.clamp(-1.0, 1.0);
+                                local_pans[track] = p;
+                                if let Some(mut state) = state.try_write() {
+                                    state.track_pans[track] = p;
+                                }
+                            }
+                        }
+                        Command::ToggleMute(track) => {
+                            if track < 4 {
+                                local_mutes[track] = !local_mutes[track];
+                                if let Some(mut state) = state.try_write() {
+                                    state.track_mutes[track] = local_mutes[track];
+                                }
+                            }
+                        }
+                        Command::ToggleSolo(track) => {
+                            if track < 4 {
+                                local_solos[track] = !local_solos[track];
+                                if let Some(mut state) = state.try_write() {
+                                    state.track_solos[track] = local_solos[track];
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -214,17 +263,44 @@ impl AudioEngine {
                         }
                     }
 
-                    // Mix all synths
-                    let sample = kick.next_sample()
-                        + snare.next_sample()
-                        + hihat.next_sample()
-                        + bass.next_sample();
+                    // Mix all synths with per-track volume, pan, mute, solo
+                    let raw = [
+                        kick.next_sample(),
+                        snare.next_sample(),
+                        hihat.next_sample(),
+                        bass.next_sample(),
+                    ];
+                    let any_solo = local_solos.iter().any(|&s| s);
 
-                    // Soft clip to prevent harsh distortion
-                    let sample = soft_clip(sample);
+                    let mut left = 0.0f32;
+                    let mut right = 0.0f32;
+                    for i in 0..4 {
+                        let audible = if any_solo {
+                            local_solos[i]
+                        } else {
+                            !local_mutes[i]
+                        };
+                        if !audible {
+                            continue;
+                        }
+                        let s = raw[i] * local_volumes[i];
+                        // Equal-power pan: pan -1.0 = full left, 0.0 = center, 1.0 = full right
+                        let angle = (local_pans[i] + 1.0) * 0.25 * std::f32::consts::PI;
+                        left += s * angle.cos();
+                        right += s * angle.sin();
+                    }
 
-                    // Write same sample to all channels (mono)
-                    for channel_sample in frame.iter_mut() {
+                    // Soft clip both channels
+                    left = soft_clip(left);
+                    right = soft_clip(right);
+
+                    // Write stereo output (left to ch0, right to ch1, mono fallback for others)
+                    for (ch, channel_sample) in frame.iter_mut().enumerate() {
+                        let sample = match ch {
+                            0 => left,
+                            1 => right,
+                            _ => (left + right) * 0.5,
+                        };
                         *channel_sample = T::from_sample(sample);
                     }
 

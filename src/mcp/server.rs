@@ -274,6 +274,97 @@ impl GridoxideMcp {
         })
     }
 
+    // === Mixer Tools ===
+
+    /// Get all mixer state
+    pub fn get_mixer(&self) -> Value {
+        let state = self.sequencer_state.read();
+        let track_names = ["kick", "snare", "hihat", "bass"];
+        let tracks: Vec<Value> = (0..4)
+            .map(|i| {
+                json!({
+                    "track": i,
+                    "name": track_names[i],
+                    "volume": state.track_volumes[i],
+                    "pan": state.track_pans[i],
+                    "mute": state.track_mutes[i],
+                    "solo": state.track_solos[i]
+                })
+            })
+            .collect();
+        json!({ "tracks": tracks })
+    }
+
+    /// Set track volume (0.0-1.0)
+    pub fn set_volume(&self, track: usize, volume: f32) -> Value {
+        if track >= 4 {
+            return json!({ "status": "error", "message": "Track must be 0-3" });
+        }
+        let volume = volume.clamp(0.0, 1.0);
+        self.dispatch(Command::SetTrackVolume { track, volume });
+        let track_name = TrackType::from_index(track)
+            .map(|t| t.name())
+            .unwrap_or("unknown");
+        json!({
+            "status": "ok",
+            "track": track,
+            "track_name": track_name,
+            "volume": volume
+        })
+    }
+
+    /// Set track pan (-1.0 to 1.0)
+    pub fn set_pan(&self, track: usize, pan: f32) -> Value {
+        if track >= 4 {
+            return json!({ "status": "error", "message": "Track must be 0-3" });
+        }
+        let pan = pan.clamp(-1.0, 1.0);
+        self.dispatch(Command::SetTrackPan { track, pan });
+        let track_name = TrackType::from_index(track)
+            .map(|t| t.name())
+            .unwrap_or("unknown");
+        json!({
+            "status": "ok",
+            "track": track,
+            "track_name": track_name,
+            "pan": pan
+        })
+    }
+
+    /// Toggle track mute
+    pub fn toggle_mute(&self, track: usize) -> Value {
+        if track >= 4 {
+            return json!({ "status": "error", "message": "Track must be 0-3" });
+        }
+        self.dispatch(Command::ToggleMute(track));
+        let track_name = TrackType::from_index(track)
+            .map(|t| t.name())
+            .unwrap_or("unknown");
+        json!({
+            "status": "ok",
+            "track": track,
+            "track_name": track_name,
+            "message": format!("Toggled mute on {}", track_name)
+        })
+    }
+
+    /// Toggle track solo
+    pub fn toggle_solo(&self, track: usize) -> Value {
+        if track >= 4 {
+            return json!({ "status": "error", "message": "Track must be 0-3" });
+        }
+        self.dispatch(Command::ToggleSolo(track));
+        let track_name = TrackType::from_index(track)
+            .map(|t| t.name())
+            .unwrap_or("unknown");
+        json!({
+            "status": "ok",
+            "track": track,
+            "track_name": track_name,
+            "message": format!("Toggled solo on {}", track_name)
+        })
+    }
+
     /// Handle an MCP tool call
     pub fn handle_tool_call(&self, tool: &str, args: &Value) -> Value {
         match tool {
@@ -325,6 +416,27 @@ impl GridoxideMcp {
             "reset_track" => {
                 let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 self.reset_track(track)
+            }
+
+            // Mixer
+            "get_mixer" => self.get_mixer(),
+            "set_volume" => {
+                let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let volume = args.get("volume").and_then(|v| v.as_f64()).unwrap_or(0.8) as f32;
+                self.set_volume(track, volume)
+            }
+            "set_pan" => {
+                let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let pan = args.get("pan").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                self.set_pan(track, pan)
+            }
+            "toggle_mute" => {
+                let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                self.toggle_mute(track)
+            }
+            "toggle_solo" => {
+                let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                self.toggle_solo(track)
             }
 
             _ => json!({ "status": "error", "message": format!("Unknown tool: {}", tool) }),
@@ -483,6 +595,82 @@ impl GridoxideMcp {
                 {
                     "name": "reset_track",
                     "description": "Reset all parameters on a track to their default values",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "track": {
+                                "type": "integer",
+                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
+                            }
+                        },
+                        "required": ["track"]
+                    }
+                },
+                {
+                    "name": "get_mixer",
+                    "description": "Get all mixer state (volumes, pans, mutes, solos) for all tracks",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "set_volume",
+                    "description": "Set track volume (0.0-1.0)",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "track": {
+                                "type": "integer",
+                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
+                            },
+                            "volume": {
+                                "type": "number",
+                                "description": "Volume level (0.0 to 1.0)",
+                                "minimum": 0.0,
+                                "maximum": 1.0
+                            }
+                        },
+                        "required": ["track", "volume"]
+                    }
+                },
+                {
+                    "name": "set_pan",
+                    "description": "Set track pan (-1.0 left to 1.0 right, 0.0 center)",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "track": {
+                                "type": "integer",
+                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
+                            },
+                            "pan": {
+                                "type": "number",
+                                "description": "Pan position (-1.0 = full left, 0.0 = center, 1.0 = full right)",
+                                "minimum": -1.0,
+                                "maximum": 1.0
+                            }
+                        },
+                        "required": ["track", "pan"]
+                    }
+                },
+                {
+                    "name": "toggle_mute",
+                    "description": "Toggle mute on a track. Muted tracks produce no audio.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "track": {
+                                "type": "integer",
+                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
+                            }
+                        },
+                        "required": ["track"]
+                    }
+                },
+                {
+                    "name": "toggle_solo",
+                    "description": "Toggle solo on a track. When any track is soloed, only soloed tracks are audible.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {

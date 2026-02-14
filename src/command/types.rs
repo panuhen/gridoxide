@@ -28,6 +28,12 @@ pub enum Command {
 
     // Single parameter adjustment
     SetParam { param: ParamId, value: f32 },
+
+    // Mixer
+    SetTrackVolume { track: usize, volume: f32 },
+    SetTrackPan { track: usize, pan: f32 },
+    ToggleMute(usize),
+    ToggleSolo(usize),
 }
 
 impl Command {
@@ -55,6 +61,14 @@ impl Command {
             Command::SetParam { param, value } => {
                 format!("Set {} to {:.2}", param.name(), value)
             }
+            Command::SetTrackVolume { track, volume } => {
+                format!("Set track {} volume to {:.2}", track, volume)
+            }
+            Command::SetTrackPan { track, pan } => {
+                format!("Set track {} pan to {:.2}", track, pan)
+            }
+            Command::ToggleMute(track) => format!("Toggle mute track {}", track),
+            Command::ToggleSolo(track) => format!("Toggle solo track {}", track),
         }
     }
 }
