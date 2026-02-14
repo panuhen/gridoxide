@@ -9,7 +9,9 @@ use crate::command::{Command, CommandReceiver};
 use crate::fx::{
     FxParamId, FxType, MasterFxParamId, MasterFxState, StereoReverb, TrackFxChain, TrackFxState,
 };
-use crate::sequencer::{Clock, Pattern};
+use crate::sequencer::{
+    Arrangement, Clock, Pattern, PatternBank, PlaybackMode, NUM_PATTERNS,
+};
 use crate::synth::{
     BassParams, BassSynth, HiHatParams, HiHatSynth, KickParams, KickSynth, ParamId, SnareParams,
     SnareSynth,
@@ -35,6 +37,13 @@ pub struct SequencerState {
     // FX state
     pub track_fx: [TrackFxState; 4],
     pub master_fx: MasterFxState,
+    // Pattern bank + arrangement
+    pub pattern_bank: PatternBank,
+    pub current_pattern: usize,
+    pub playback_mode: PlaybackMode,
+    pub arrangement: Arrangement,
+    pub arrangement_position: usize,
+    pub arrangement_repeat: usize,
 }
 
 impl SequencerState {
@@ -59,6 +68,12 @@ impl SequencerState {
                 TrackFxState::default(),
             ],
             master_fx: MasterFxState::default(),
+            pattern_bank: PatternBank::new(),
+            current_pattern: 0,
+            playback_mode: PlaybackMode::Pattern,
+            arrangement: Arrangement::new(),
+            arrangement_position: 0,
+            arrangement_repeat: 0,
         }
     }
 }
@@ -132,6 +147,15 @@ impl AudioEngine {
         // Local pattern copy (synced periodically from shared state)
         let mut pattern = Pattern::new();
 
+        // Pattern bank + arrangement local state
+        let mut local_pattern_bank = PatternBank::new();
+        let mut local_current_pattern: usize = 0;
+        let mut local_playback_mode = PlaybackMode::Pattern;
+        let mut local_arrangement = Arrangement::new();
+        let mut local_arrangement_position: usize = 0;
+        let mut local_arrangement_repeat: usize = 0;
+        let mut pending_pattern_switch: Option<usize> = None;
+
         // Local mixer state
         let mut local_volumes = [0.8f32; 4];
         let mut local_pans = [0.0f32; 4];
@@ -175,11 +199,30 @@ impl AudioEngine {
                                 state.playing = true;
                             }
                         }
+                        Command::Pause => {
+                            clock.pause();
+                            if let Some(mut state) = state.try_write() {
+                                state.playing = false;
+                            }
+                        }
                         Command::Stop => {
                             clock.stop();
+                            // Apply any pending pattern switch immediately on stop
+                            if let Some(new_pat) = pending_pattern_switch.take() {
+                                local_pattern_bank.get_mut(local_current_pattern).steps = pattern.steps;
+                                local_current_pattern = new_pat;
+                                pattern = local_pattern_bank.get(new_pat).clone();
+                            }
+                            // Reset song position
+                            local_arrangement_position = 0;
+                            local_arrangement_repeat = 0;
                             if let Some(mut state) = state.try_write() {
                                 state.playing = false;
                                 state.current_step = 0;
+                                state.current_pattern = local_current_pattern;
+                                state.pattern = pattern.clone();
+                                state.arrangement_position = 0;
+                                state.arrangement_repeat = 0;
                             }
                         }
                         Command::SetBpm(bpm) => {
@@ -190,26 +233,34 @@ impl AudioEngine {
                         }
                         Command::ToggleStep { track, step } => {
                             pattern.toggle(track, step);
+                            local_pattern_bank.get_mut(local_current_pattern).toggle(track, step);
                             if let Some(mut state) = state.try_write() {
                                 state.pattern = pattern.clone();
+                                state.pattern_bank.get_mut(local_current_pattern).steps = pattern.steps;
                             }
                         }
                         Command::ClearTrack(track) => {
                             pattern.clear_track(track);
+                            local_pattern_bank.get_mut(local_current_pattern).clear_track(track);
                             if let Some(mut state) = state.try_write() {
                                 state.pattern = pattern.clone();
+                                state.pattern_bank.get_mut(local_current_pattern).steps = pattern.steps;
                             }
                         }
                         Command::FillTrack(track) => {
                             pattern.fill_track(track);
+                            local_pattern_bank.get_mut(local_current_pattern).fill_track(track);
                             if let Some(mut state) = state.try_write() {
                                 state.pattern = pattern.clone();
+                                state.pattern_bank.get_mut(local_current_pattern).steps = pattern.steps;
                             }
                         }
                         Command::SetStepNote { track, step, note } => {
                             pattern.set_note(track, step, note);
+                            local_pattern_bank.get_mut(local_current_pattern).set_note(track, step, note);
                             if let Some(mut state) = state.try_write() {
                                 state.pattern.set_note(track, step, note);
+                                state.pattern_bank.get_mut(local_current_pattern).set_note(track, step, note);
                             }
                         }
                         // Synth parameter commands
@@ -335,6 +386,117 @@ impl AudioEngine {
                                 state.master_fx.reverb_enabled = reverb_enabled;
                             }
                         }
+
+                        // Pattern Bank commands
+                        Command::SelectPattern(p) => {
+                            if p < NUM_PATTERNS {
+                                // Save current pattern to bank
+                                local_pattern_bank.get_mut(local_current_pattern).steps = pattern.steps;
+
+                                if clock.is_playing() {
+                                    // Queue for boundary switch
+                                    pending_pattern_switch = Some(p);
+                                } else {
+                                    // Apply immediately when stopped
+                                    local_current_pattern = p;
+                                    pattern = local_pattern_bank.get(p).clone();
+                                    pending_pattern_switch = None;
+                                }
+
+                                if let Some(mut state) = state.try_write() {
+                                    state.pattern_bank = local_pattern_bank.clone();
+                                    if !clock.is_playing() {
+                                        state.current_pattern = p;
+                                        state.pattern = pattern.clone();
+                                    }
+                                }
+                            }
+                        }
+                        Command::CopyPattern { src, dst } => {
+                            if src < NUM_PATTERNS && dst < NUM_PATTERNS {
+                                let src_pattern = local_pattern_bank.get(src).clone();
+                                *local_pattern_bank.get_mut(dst) = src_pattern;
+                                // If we copied into the active pattern, update local
+                                if dst == local_current_pattern {
+                                    pattern = local_pattern_bank.get(dst).clone();
+                                }
+                                if let Some(mut state) = state.try_write() {
+                                    state.pattern_bank = local_pattern_bank.clone();
+                                    if dst == local_current_pattern {
+                                        state.pattern = pattern.clone();
+                                    }
+                                }
+                            }
+                        }
+                        Command::ClearPattern(p) => {
+                            if p < NUM_PATTERNS {
+                                local_pattern_bank.get_mut(p).clear_all();
+                                if p == local_current_pattern {
+                                    pattern = local_pattern_bank.get(p).clone();
+                                }
+                                if let Some(mut state) = state.try_write() {
+                                    state.pattern_bank = local_pattern_bank.clone();
+                                    if p == local_current_pattern {
+                                        state.pattern = pattern.clone();
+                                    }
+                                }
+                            }
+                        }
+
+                        // Playback mode
+                        Command::SetPlaybackMode(mode) => {
+                            local_playback_mode = mode;
+                            if mode == PlaybackMode::Song {
+                                local_arrangement_position = 0;
+                                local_arrangement_repeat = 0;
+                            }
+                            if let Some(mut state) = state.try_write() {
+                                state.playback_mode = mode;
+                                state.arrangement_position = local_arrangement_position;
+                                state.arrangement_repeat = local_arrangement_repeat;
+                            }
+                        }
+
+                        // Arrangement commands
+                        Command::AppendArrangement { pattern: p, repeats } => {
+                            local_arrangement.append(p, repeats);
+                            if let Some(mut state) = state.try_write() {
+                                state.arrangement = local_arrangement.clone();
+                            }
+                        }
+                        Command::InsertArrangement { position, pattern: p, repeats } => {
+                            local_arrangement.insert(position, p, repeats);
+                            if let Some(mut state) = state.try_write() {
+                                state.arrangement = local_arrangement.clone();
+                            }
+                        }
+                        Command::RemoveArrangement(pos) => {
+                            local_arrangement.remove(pos);
+                            // Adjust position if needed
+                            if local_arrangement_position >= local_arrangement.len() && local_arrangement.len() > 0 {
+                                local_arrangement_position = local_arrangement.len() - 1;
+                            }
+                            if let Some(mut state) = state.try_write() {
+                                state.arrangement = local_arrangement.clone();
+                                state.arrangement_position = local_arrangement_position;
+                            }
+                        }
+                        Command::SetArrangementEntry { position, pattern: p, repeats } => {
+                            local_arrangement.set_entry(position, p, repeats);
+                            if let Some(mut state) = state.try_write() {
+                                state.arrangement = local_arrangement.clone();
+                            }
+                        }
+                        Command::ClearArrangement => {
+                            local_arrangement.clear();
+                            local_arrangement_position = 0;
+                            local_arrangement_repeat = 0;
+                            if let Some(mut state) = state.try_write() {
+                                state.arrangement = local_arrangement.clone();
+                                state.arrangement_position = 0;
+                                state.arrangement_repeat = 0;
+                            }
+                        }
                     }
                 }
 
@@ -358,6 +520,50 @@ impl AudioEngine {
                         let s3 = pattern.get_step(3, step);
                         if s3.active {
                             bass.trigger_with_note(s3.note);
+                        }
+                    }
+
+                    // Pattern boundary logic
+                    if clock.take_pattern_wrap() {
+                        match local_playback_mode {
+                            PlaybackMode::Pattern => {
+                                // Apply pending pattern switch at boundary
+                                if let Some(new_pat) = pending_pattern_switch.take() {
+                                    local_pattern_bank.get_mut(local_current_pattern).steps = pattern.steps;
+                                    local_current_pattern = new_pat;
+                                    pattern = local_pattern_bank.get(new_pat).clone();
+                                    if let Some(mut state) = state.try_write() {
+                                        state.current_pattern = new_pat;
+                                        state.pattern = pattern.clone();
+                                        state.pattern_bank = local_pattern_bank.clone();
+                                    }
+                                }
+                            }
+                            PlaybackMode::Song => {
+                                if !local_arrangement.is_empty() {
+                                    let entry = local_arrangement.entries[local_arrangement_position];
+                                    local_arrangement_repeat += 1;
+                                    if local_arrangement_repeat >= entry.repeats {
+                                        // Advance to next entry
+                                        local_arrangement_repeat = 0;
+                                        local_arrangement_position = (local_arrangement_position + 1)
+                                            % local_arrangement.len();
+                                        // Load new pattern from bank
+                                        let new_entry = local_arrangement.entries[local_arrangement_position];
+                                        local_pattern_bank.get_mut(local_current_pattern).steps = pattern.steps;
+                                        local_current_pattern = new_entry.pattern;
+                                        pattern = local_pattern_bank.get(new_entry.pattern).clone();
+                                        if let Some(mut state) = state.try_write() {
+                                            state.current_pattern = local_current_pattern;
+                                            state.pattern = pattern.clone();
+                                            state.arrangement_position = local_arrangement_position;
+                                            state.arrangement_repeat = local_arrangement_repeat;
+                                        }
+                                    } else if let Some(mut state) = state.try_write() {
+                                        state.arrangement_repeat = local_arrangement_repeat;
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -419,6 +625,10 @@ impl AudioEngine {
                             state.current_step = clock.current_step();
                             state.playing = clock.is_playing();
                             state.pattern = pattern.clone();
+                            state.current_pattern = local_current_pattern;
+                            state.playback_mode = local_playback_mode;
+                            state.arrangement_position = local_arrangement_position;
+                            state.arrangement_repeat = local_arrangement_repeat;
                         }
                     }
                 }

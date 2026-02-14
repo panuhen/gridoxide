@@ -1,7 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders};
 
-use crate::sequencer::{Pattern, TrackType, STEPS, TRACKS};
+use crate::sequencer::{Pattern, PlaybackMode, TrackType, STEPS, TRACKS};
 use crate::synth::note_name;
 use crate::ui::Theme;
 
@@ -183,39 +183,79 @@ pub fn render_grid(
     }
 }
 
+/// Transport info for rendering
+pub struct TransportInfo {
+    pub playing: bool,
+    pub bpm: f32,
+    pub current_step: usize,
+    pub current_pattern: usize,
+    pub playback_mode: PlaybackMode,
+    pub arrangement_position: usize,
+    pub arrangement_len: usize,
+    pub cursor_note: Option<(bool, u8)>,
+    pub pending_pattern: Option<usize>,
+}
+
 /// Render transport status bar
 pub fn render_transport(
     frame: &mut Frame,
     area: Rect,
-    playing: bool,
-    bpm: f32,
-    current_step: usize,
+    info: &TransportInfo,
     theme: &Theme,
-    cursor_note: Option<(bool, u8)>,
 ) {
-    let status = if playing { "PLAY" } else { "STOP" };
-    let status_style = if playing {
+    let status = if info.playing { "PLAY" } else { "STOP" };
+    let status_style = if info.playing {
         Style::default().fg(theme.meter_high).bold()
     } else {
         Style::default().fg(theme.dimmed)
+    };
+
+    let mode_str = match info.playback_mode {
+        PlaybackMode::Pattern => "PAT",
+        PlaybackMode::Song => "SONG",
+    };
+
+    let pat_display = if let Some(pending) = info.pending_pattern {
+        format!("Pat: {:02}>{:02}", info.current_pattern, pending)
+    } else {
+        format!("Pat: {:02}", info.current_pattern)
     };
 
     let mut transport_text = vec![
         Span::styled(format!(" {} ", status), status_style),
         Span::styled(" | ", Style::default().fg(theme.border)),
         Span::styled(
-            format!("BPM: {:.0}", bpm),
+            format!("{} ", mode_str),
+            Style::default().fg(theme.highlight),
+        ),
+        Span::styled(" | ", Style::default().fg(theme.border)),
+        Span::styled(
+            pat_display,
             Style::default().fg(theme.fg),
         ),
         Span::styled(" | ", Style::default().fg(theme.border)),
         Span::styled(
-            format!("Step: {:2}/16", current_step + 1),
+            format!("BPM: {:.0}", info.bpm),
+            Style::default().fg(theme.fg),
+        ),
+        Span::styled(" | ", Style::default().fg(theme.border)),
+        Span::styled(
+            format!("Step: {:2}/16", info.current_step + 1),
             Style::default().fg(theme.fg),
         ),
     ];
 
+    // Show song position in song mode
+    if info.playback_mode == PlaybackMode::Song && info.arrangement_len > 0 {
+        transport_text.push(Span::styled(" | ", Style::default().fg(theme.border)));
+        transport_text.push(Span::styled(
+            format!("Song: {}/{}", info.arrangement_position + 1, info.arrangement_len),
+            Style::default().fg(theme.highlight),
+        ));
+    }
+
     // Show note info when cursor is on an active step
-    if let Some((active, note)) = cursor_note {
+    if let Some((active, note)) = info.cursor_note {
         if active {
             transport_text.push(Span::styled(" | ", Style::default().fg(theme.border)));
             transport_text.push(Span::styled(

@@ -19,9 +19,11 @@ use crate::command::{Command, CommandBus, CommandSender, CommandSource};
 use crate::event::EventLog;
 use crate::fx::{FilterType, FxParamId, FxType, MasterFxParamId};
 use crate::mcp::{start_socket_server, GridoxideMcp};
+use crate::sequencer::{PlaybackMode, NUM_PATTERNS};
 use crate::ui::{
-    get_param_value, render_fx, render_grid, render_mixer, render_params, render_transport,
-    FxEditorState, GridState, MixerField, MixerState, ParamEditorState, Theme,
+    get_param_value, render_fx, render_grid, render_mixer, render_params, render_song,
+    render_transport, FxEditorState, GridState, MixerField, MixerState, ParamEditorState,
+    SongState, Theme, TransportInfo,
 };
 
 /// Current UI view
@@ -31,6 +33,7 @@ pub enum View {
     Params,
     Mixer,
     Fx,
+    Song,
 }
 
 /// Application state
@@ -53,6 +56,8 @@ pub struct App {
     mixer_state: MixerState,
     /// FX editor state
     fx_editor: FxEditorState,
+    /// Song/arrangement editor state
+    song_state: SongState,
     /// Current view
     view: View,
     /// Whether the app should quit
@@ -95,6 +100,7 @@ impl App {
             param_editor: ParamEditorState::new(),
             mixer_state: MixerState::new(),
             fx_editor: FxEditorState::new(),
+            song_state: SongState::new(),
             view: View::Grid,
             should_quit: false,
             mcp_shutdown,
@@ -186,6 +192,7 @@ impl App {
             View::Params => self.handle_params_key(key),
             View::Mixer => self.handle_mixer_key(key),
             View::Fx => self.handle_fx_key(key),
+            View::Song => self.handle_song_key(key),
         }
     }
 
@@ -217,7 +224,7 @@ impl App {
             KeyCode::Char('p') => {
                 let playing = self.sequencer_state.read().playing;
                 if playing {
-                    self.dispatch(Command::Stop);
+                    self.dispatch(Command::Pause);
                 } else {
                     self.dispatch(Command::Play);
                 }
@@ -279,6 +286,18 @@ impl App {
                 self.adjust_step_note(12);
             }
 
+            // Pattern selection
+            KeyCode::Char(',') | KeyCode::Char('<') => {
+                let current = self.sequencer_state.read().current_pattern;
+                let new_pat = if current == 0 { NUM_PATTERNS - 1 } else { current - 1 };
+                self.dispatch(Command::SelectPattern(new_pat));
+            }
+            KeyCode::Char('.') | KeyCode::Char('>') => {
+                let current = self.sequencer_state.read().current_pattern;
+                let new_pat = (current + 1) % NUM_PATTERNS;
+                self.dispatch(Command::SelectPattern(new_pat));
+            }
+
             _ => {}
         }
     }
@@ -333,7 +352,7 @@ impl App {
             KeyCode::Char('p') => {
                 let playing = self.sequencer_state.read().playing;
                 if playing {
-                    self.dispatch(Command::Stop);
+                    self.dispatch(Command::Pause);
                 } else {
                     self.dispatch(Command::Play);
                 }
@@ -399,7 +418,7 @@ impl App {
             KeyCode::Char('p') => {
                 let playing = self.sequencer_state.read().playing;
                 if playing {
-                    self.dispatch(Command::Stop);
+                    self.dispatch(Command::Pause);
                 } else {
                     self.dispatch(Command::Play);
                 }
@@ -420,9 +439,9 @@ impl App {
                 self.should_quit = true;
             }
 
-            // Tab cycles to Grid, Esc goes back to grid
+            // Tab cycles to Song view, Esc goes back to grid
             KeyCode::Tab => {
-                self.view = View::Grid;
+                self.view = View::Song;
             }
             KeyCode::Esc => {
                 self.view = View::Grid;
@@ -468,7 +487,170 @@ impl App {
             KeyCode::Char('p') => {
                 let playing = self.sequencer_state.read().playing;
                 if playing {
-                    self.dispatch(Command::Stop);
+                    self.dispatch(Command::Pause);
+                } else {
+                    self.dispatch(Command::Play);
+                }
+            }
+            KeyCode::Char('s') => {
+                self.dispatch(Command::Stop);
+            }
+
+            _ => {}
+        }
+    }
+
+    /// Handle keys in song/arrangement view
+    fn handle_song_key(&mut self, key: KeyCode) {
+        match key {
+            // Quit
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+            }
+
+            // Tab cycles to Grid, Esc goes back to grid
+            KeyCode::Tab => {
+                self.view = View::Grid;
+            }
+            KeyCode::Esc => {
+                self.view = View::Grid;
+            }
+
+            // Navigate arrangement
+            KeyCode::Up | KeyCode::Char('k') => {
+                let arr_len = self.sequencer_state.read().arrangement.len();
+                if arr_len > 0 && self.song_state.cursor_position > 0 {
+                    self.song_state.cursor_position -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let arr_len = self.sequencer_state.read().arrangement.len();
+                if arr_len > 0 && self.song_state.cursor_position < arr_len - 1 {
+                    self.song_state.cursor_position += 1;
+                }
+            }
+
+            // Adjust repeat count
+            KeyCode::Left | KeyCode::Char('h') => {
+                let state = self.sequencer_state.read();
+                let pos = self.song_state.cursor_position;
+                if pos < state.arrangement.len() {
+                    let entry = state.arrangement.entries[pos];
+                    drop(state);
+                    if entry.repeats > 1 {
+                        self.dispatch(Command::SetArrangementEntry {
+                            position: pos,
+                            pattern: entry.pattern,
+                            repeats: entry.repeats - 1,
+                        });
+                    }
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                let state = self.sequencer_state.read();
+                let pos = self.song_state.cursor_position;
+                if pos < state.arrangement.len() {
+                    let entry = state.arrangement.entries[pos];
+                    drop(state);
+                    if entry.repeats < 16 {
+                        self.dispatch(Command::SetArrangementEntry {
+                            position: pos,
+                            pattern: entry.pattern,
+                            repeats: entry.repeats + 1,
+                        });
+                    }
+                }
+            }
+
+            // Append current pattern to arrangement
+            KeyCode::Char('a') => {
+                let current_pat = self.sequencer_state.read().current_pattern;
+                self.dispatch(Command::AppendArrangement {
+                    pattern: current_pat,
+                    repeats: 1,
+                });
+                // Move cursor to new entry
+                let new_len = self.sequencer_state.read().arrangement.len();
+                if new_len > 0 {
+                    self.song_state.cursor_position = new_len - 1;
+                }
+            }
+
+            // Delete entry at cursor
+            KeyCode::Char('d') | KeyCode::Delete => {
+                let arr_len = self.sequencer_state.read().arrangement.len();
+                if arr_len > 0 {
+                    self.dispatch(Command::RemoveArrangement(self.song_state.cursor_position));
+                    // Adjust cursor
+                    let new_len = self.sequencer_state.read().arrangement.len();
+                    if self.song_state.cursor_position >= new_len && new_len > 0 {
+                        self.song_state.cursor_position = new_len - 1;
+                    }
+                }
+            }
+
+            // Set entry's pattern to current pattern
+            KeyCode::Enter => {
+                let state = self.sequencer_state.read();
+                let pos = self.song_state.cursor_position;
+                if pos < state.arrangement.len() {
+                    let current_pat = state.current_pattern;
+                    let repeats = state.arrangement.entries[pos].repeats;
+                    drop(state);
+                    self.dispatch(Command::SetArrangementEntry {
+                        position: pos,
+                        pattern: current_pat,
+                        repeats,
+                    });
+                }
+            }
+
+            // Pattern selection (same as grid)
+            KeyCode::Char(',') | KeyCode::Char('<') => {
+                let current = self.sequencer_state.read().current_pattern;
+                let new_pat = if current == 0 { NUM_PATTERNS - 1 } else { current - 1 };
+                self.dispatch(Command::SelectPattern(new_pat));
+            }
+            KeyCode::Char('.') | KeyCode::Char('>') => {
+                let current = self.sequencer_state.read().current_pattern;
+                let new_pat = (current + 1) % NUM_PATTERNS;
+                self.dispatch(Command::SelectPattern(new_pat));
+            }
+
+            // Toggle Pattern/Song mode
+            KeyCode::Char('m') => {
+                let current_mode = self.sequencer_state.read().playback_mode;
+                let new_mode = match current_mode {
+                    PlaybackMode::Pattern => PlaybackMode::Song,
+                    PlaybackMode::Song => PlaybackMode::Pattern,
+                };
+                self.dispatch(Command::SetPlaybackMode(new_mode));
+            }
+
+            // Copy current pattern to next empty slot (or prompt)
+            KeyCode::Char('c') => {
+                let state = self.sequencer_state.read();
+                let src = state.current_pattern;
+                // Find next empty slot
+                let dst = (0..NUM_PATTERNS)
+                    .find(|&i| i != src && !state.pattern_bank.has_content(i));
+                drop(state);
+                if let Some(dst) = dst {
+                    self.dispatch(Command::CopyPattern { src, dst });
+                }
+            }
+
+            // Clear current pattern slot
+            KeyCode::Char('x') => {
+                let current = self.sequencer_state.read().current_pattern;
+                self.dispatch(Command::ClearPattern(current));
+            }
+
+            // Play/Stop
+            KeyCode::Char('p') => {
+                let playing = self.sequencer_state.read().playing;
+                if playing {
+                    self.dispatch(Command::Pause);
                 } else {
                     self.dispatch(Command::Play);
                 }
@@ -668,14 +850,22 @@ impl App {
                 None
             }
         };
+        let transport_info = TransportInfo {
+            playing: state.playing,
+            bpm: state.bpm,
+            current_step: state.current_step,
+            current_pattern: state.current_pattern,
+            playback_mode: state.playback_mode,
+            arrangement_position: state.arrangement_position,
+            arrangement_len: state.arrangement.len(),
+            cursor_note,
+            pending_pattern: None,
+        };
         render_transport(
             frame,
             chunks[1],
-            state.playing,
-            state.bpm,
-            state.current_step,
+            &transport_info,
             &self.theme,
-            cursor_note,
         );
 
         // Render main content based on view
@@ -700,6 +890,9 @@ impl App {
             View::Fx => {
                 render_fx(frame, chunks[2], &state, &self.fx_editor, &self.theme);
             }
+            View::Song => {
+                render_song(frame, chunks[2], &state, &self.song_state, &self.theme);
+            }
         }
 
         self.render_footer(frame, chunks[3]);
@@ -712,6 +905,7 @@ impl App {
             View::Params => "[PARAMS]",
             View::Mixer => "[MIXER]",
             View::Fx => "[FX]",
+            View::Song => "[SONG]",
         };
         let title = format!(
             " GRIDOXIDE v{} {} ",
@@ -739,7 +933,7 @@ impl App {
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let help = match self.view {
             View::Grid => format!(
-                "SPACE:Toggle | [/]:Note | P:Play | S:Stop | +/-:BPM | C:Clear | F:Fill | TAB:Params | Q:Quit | {}",
+                "SPACE:Toggle | [/]:Note | ,/.:Pattern | P:Play | S:Stop | +/-:BPM | C:Clear | F:Fill | TAB:Params | Q:Quit | {}",
                 self.theme.name
             ),
             View::Params => format!(
@@ -751,7 +945,11 @@ impl App {
                 self.theme.name
             ),
             View::Fx => format!(
-                "1-5:Track/Master | Up/Down:Select | Left/Right:Adjust | SPACE:Toggle FX | TAB:Grid | Q:Quit | {}",
+                "1-5:Track/Master | Up/Down:Select | Left/Right:Adjust | SPACE:Toggle FX | TAB:Song | Q:Quit | {}",
+                self.theme.name
+            ),
+            View::Song => format!(
+                "Up/Down:Move | Left/Right:Repeats | A:Add | D:Delete | Enter:Set Pat | ,/.:Pattern | M:Mode | P:Play | TAB:Grid | Q:Quit | {}",
                 self.theme.name
             ),
         };

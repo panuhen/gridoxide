@@ -4,6 +4,127 @@ use crate::synth::DEFAULT_NOTES;
 
 pub const STEPS: usize = 16;
 pub const TRACKS: usize = 4;
+pub const NUM_PATTERNS: usize = 16;
+pub const MAX_ARRANGEMENT_ENTRIES: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlaybackMode {
+    Pattern,
+    Song,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ArrangementEntry {
+    pub pattern: usize, // 0-15
+    pub repeats: usize, // 1-16
+}
+
+impl ArrangementEntry {
+    pub fn new(pattern: usize, repeats: usize) -> Self {
+        Self {
+            pattern: pattern.min(NUM_PATTERNS - 1),
+            repeats: repeats.clamp(1, 16),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Arrangement {
+    pub entries: Vec<ArrangementEntry>,
+}
+
+impl Arrangement {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(MAX_ARRANGEMENT_ENTRIES),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn append(&mut self, pattern: usize, repeats: usize) {
+        if self.entries.len() < MAX_ARRANGEMENT_ENTRIES {
+            self.entries.push(ArrangementEntry::new(pattern, repeats));
+        }
+    }
+
+    pub fn insert(&mut self, position: usize, pattern: usize, repeats: usize) {
+        if self.entries.len() < MAX_ARRANGEMENT_ENTRIES && position <= self.entries.len() {
+            self.entries
+                .insert(position, ArrangementEntry::new(pattern, repeats));
+        }
+    }
+
+    pub fn remove(&mut self, position: usize) {
+        if position < self.entries.len() {
+            self.entries.remove(position);
+        }
+    }
+
+    pub fn set_entry(&mut self, position: usize, pattern: usize, repeats: usize) {
+        if position < self.entries.len() {
+            self.entries[position] = ArrangementEntry::new(pattern, repeats);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+impl Default for Arrangement {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PatternBank {
+    pub patterns: Vec<Pattern>, // always NUM_PATTERNS length
+}
+
+impl PatternBank {
+    pub fn new() -> Self {
+        Self {
+            patterns: (0..NUM_PATTERNS).map(|_| Pattern::new()).collect(),
+        }
+    }
+
+    pub fn get(&self, index: usize) -> &Pattern {
+        &self.patterns[index.min(NUM_PATTERNS - 1)]
+    }
+
+    pub fn get_mut(&mut self, index: usize) -> &mut Pattern {
+        &mut self.patterns[index.min(NUM_PATTERNS - 1)]
+    }
+
+    /// Returns true if a pattern has any active steps
+    pub fn has_content(&self, index: usize) -> bool {
+        if index >= NUM_PATTERNS {
+            return false;
+        }
+        for track in 0..TRACKS {
+            for step in 0..STEPS {
+                if self.patterns[index].get(track, step) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+impl Default for PatternBank {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrackType {

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::fx::{FilterType, FxParamId, FxType, MasterFxParamId};
+use crate::sequencer::PlaybackMode;
 use crate::synth::{BassParams, HiHatParams, KickParams, ParamId, SnareParams};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -13,6 +14,7 @@ pub enum CommandSource {
 pub enum Command {
     // Transport
     Play,
+    Pause,
     Stop,
     SetBpm(f32),
 
@@ -47,6 +49,21 @@ pub enum Command {
     // Master FX
     SetMasterFxParam { param: MasterFxParamId, value: f32 },
     ToggleMasterFxEnabled,
+
+    // Pattern Bank
+    SelectPattern(usize),
+    CopyPattern { src: usize, dst: usize },
+    ClearPattern(usize),
+
+    // Playback Mode
+    SetPlaybackMode(PlaybackMode),
+
+    // Arrangement
+    AppendArrangement { pattern: usize, repeats: usize },
+    InsertArrangement { position: usize, pattern: usize, repeats: usize },
+    RemoveArrangement(usize),
+    SetArrangementEntry { position: usize, pattern: usize, repeats: usize },
+    ClearArrangement,
 }
 
 impl Command {
@@ -60,6 +77,7 @@ impl Command {
     pub fn description(&self) -> String {
         match self {
             Command::Play => "Play".to_string(),
+            Command::Pause => "Pause".to_string(),
             Command::Stop => "Stop".to_string(),
             Command::SetBpm(bpm) => format!("Set BPM to {}", bpm),
             Command::ToggleStep { track, step } => {
@@ -98,6 +116,45 @@ impl Command {
                 format!("Set master {} to {:.2}", param.name(), value)
             }
             Command::ToggleMasterFxEnabled => "Toggle master reverb".to_string(),
+            Command::SelectPattern(p) => format!("Select pattern {:02}", p),
+            Command::CopyPattern { src, dst } => {
+                format!("Copy pattern {:02} to {:02}", src, dst)
+            }
+            Command::ClearPattern(p) => format!("Clear pattern {:02}", p),
+            Command::SetPlaybackMode(mode) => {
+                let name = match mode {
+                    PlaybackMode::Pattern => "Pattern",
+                    PlaybackMode::Song => "Song",
+                };
+                format!("Set playback mode to {}", name)
+            }
+            Command::AppendArrangement { pattern, repeats } => {
+                format!("Append pattern {:02} x{} to arrangement", pattern, repeats)
+            }
+            Command::InsertArrangement {
+                position,
+                pattern,
+                repeats,
+            } => {
+                format!(
+                    "Insert pattern {:02} x{} at position {}",
+                    pattern, repeats, position
+                )
+            }
+            Command::RemoveArrangement(pos) => {
+                format!("Remove arrangement entry {}", pos)
+            }
+            Command::SetArrangementEntry {
+                position,
+                pattern,
+                repeats,
+            } => {
+                format!(
+                    "Set arrangement entry {} to pattern {:02} x{}",
+                    position, pattern, repeats
+                )
+            }
+            Command::ClearArrangement => "Clear arrangement".to_string(),
         }
     }
 }

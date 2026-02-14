@@ -7,7 +7,7 @@ use crate::audio::SequencerState;
 use crate::command::{Command, CommandSender, CommandSource};
 use crate::event::EventLog;
 use crate::fx::{FilterType, FxParamId, FxType, MasterFxParamId};
-use crate::sequencer::TrackType;
+use crate::sequencer::{PlaybackMode, TrackType, NUM_PATTERNS};
 use crate::synth::{note_name, BassParams, HiHatParams, KickParams, ParamId, SnareParams, DEFAULT_NOTES};
 use crate::ui::get_param_value;
 
@@ -45,6 +45,12 @@ impl GridoxideMcp {
         json!({ "status": "ok", "message": "Playback started" })
     }
 
+    /// Pause playback (keep position)
+    pub fn pause(&self) -> Value {
+        self.dispatch(Command::Pause);
+        json!({ "status": "ok", "message": "Playback paused" })
+    }
+
     /// Stop playback and reset to step 0
     pub fn stop(&self) -> Value {
         self.dispatch(Command::Stop);
@@ -61,10 +67,18 @@ impl GridoxideMcp {
     /// Get current transport state
     pub fn get_state(&self) -> Value {
         let state = self.sequencer_state.read();
+        let mode_str = match state.playback_mode {
+            PlaybackMode::Pattern => "pattern",
+            PlaybackMode::Song => "song",
+        };
         json!({
             "playing": state.playing,
             "bpm": state.bpm,
-            "current_step": state.current_step
+            "current_step": state.current_step,
+            "current_pattern": state.current_pattern,
+            "playback_mode": mode_str,
+            "arrangement_position": state.arrangement_position,
+            "arrangement_repeat": state.arrangement_repeat
         })
     }
 
@@ -99,16 +113,22 @@ impl GridoxideMcp {
         })
     }
 
-    /// Get the full pattern grid (including note data)
-    pub fn get_pattern(&self) -> Value {
+    /// Get the full pattern grid (including note data). If pattern_index is Some, read from bank.
+    pub fn get_pattern(&self, pattern_index: Option<usize>) -> Value {
         let state = self.sequencer_state.read();
+        let pat = match pattern_index {
+            Some(idx) if idx < NUM_PATTERNS => state.pattern_bank.get(idx),
+            _ => &state.pattern,
+        };
+        let display_idx = pattern_index.unwrap_or(state.current_pattern);
+
         let tracks: Vec<Value> = (0..4)
             .map(|track| {
                 let track_type = TrackType::from_index(track).unwrap();
-                let steps: Vec<bool> = (0..16).map(|step| state.pattern.get(track, step)).collect();
+                let steps: Vec<bool> = (0..16).map(|step| pat.get(track, step)).collect();
                 let notes: Vec<Value> = (0..16)
                     .map(|step| {
-                        let sd = state.pattern.get_step(track, step);
+                        let sd = pat.get_step(track, step);
                         json!({
                             "note": sd.note,
                             "note_name": note_name(sd.note)
@@ -126,6 +146,7 @@ impl GridoxideMcp {
             .collect();
 
         json!({
+            "pattern": display_idx,
             "tracks": tracks
         })
     }
@@ -617,11 +638,209 @@ impl GridoxideMcp {
         })
     }
 
+    // === Pattern Bank Tools ===
+
+    /// Select active pattern (0-15)
+    pub fn select_pattern(&self, pattern: usize) -> Value {
+        if pattern >= NUM_PATTERNS {
+            return json!({ "status": "error", "message": "Pattern must be 0-15" });
+        }
+        self.dispatch(Command::SelectPattern(pattern));
+        json!({
+            "status": "ok",
+            "pattern": pattern,
+            "message": format!("Selected pattern {:02}", pattern)
+        })
+    }
+
+    /// Get overview of all 16 patterns
+    pub fn get_pattern_bank(&self) -> Value {
+        let state = self.sequencer_state.read();
+        let patterns: Vec<Value> = (0..NUM_PATTERNS)
+            .map(|i| {
+                let has_content = state.pattern_bank.has_content(i);
+                let active_steps: usize = (0..4)
+                    .map(|t| (0..16).filter(|&s| state.pattern_bank.get(i).get(t, s)).count())
+                    .sum();
+                json!({
+                    "index": i,
+                    "has_content": has_content,
+                    "active_steps": active_steps,
+                    "is_current": i == state.current_pattern
+                })
+            })
+            .collect();
+
+        json!({
+            "current_pattern": state.current_pattern,
+            "patterns": patterns
+        })
+    }
+
+    /// Copy pattern from src to dst
+    pub fn copy_pattern(&self, src: usize, dst: usize) -> Value {
+        if src >= NUM_PATTERNS || dst >= NUM_PATTERNS {
+            return json!({ "status": "error", "message": "Pattern indices must be 0-15" });
+        }
+        self.dispatch(Command::CopyPattern { src, dst });
+        json!({
+            "status": "ok",
+            "message": format!("Copied pattern {:02} to {:02}", src, dst)
+        })
+    }
+
+    /// Clear a pattern slot
+    pub fn clear_pattern(&self, pattern: usize) -> Value {
+        if pattern >= NUM_PATTERNS {
+            return json!({ "status": "error", "message": "Pattern must be 0-15" });
+        }
+        self.dispatch(Command::ClearPattern(pattern));
+        json!({
+            "status": "ok",
+            "message": format!("Cleared pattern {:02}", pattern)
+        })
+    }
+
+    /// Set playback mode
+    pub fn set_playback_mode(&self, mode: &str) -> Value {
+        let playback_mode = match mode {
+            "pattern" => PlaybackMode::Pattern,
+            "song" => PlaybackMode::Song,
+            _ => {
+                return json!({
+                    "status": "error",
+                    "message": "Mode must be 'pattern' or 'song'"
+                })
+            }
+        };
+        self.dispatch(Command::SetPlaybackMode(playback_mode));
+        json!({
+            "status": "ok",
+            "mode": mode,
+            "message": format!("Set playback mode to {}", mode)
+        })
+    }
+
+    // === Arrangement Tools ===
+
+    /// Get full arrangement
+    pub fn get_arrangement(&self) -> Value {
+        let state = self.sequencer_state.read();
+        let entries: Vec<Value> = state
+            .arrangement
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                json!({
+                    "position": i,
+                    "pattern": e.pattern,
+                    "repeats": e.repeats,
+                    "is_playing": state.playback_mode == PlaybackMode::Song && i == state.arrangement_position
+                })
+            })
+            .collect();
+
+        let mode_str = match state.playback_mode {
+            PlaybackMode::Pattern => "pattern",
+            PlaybackMode::Song => "song",
+        };
+
+        json!({
+            "entries": entries,
+            "length": state.arrangement.len(),
+            "playback_mode": mode_str,
+            "current_position": state.arrangement_position,
+            "current_repeat": state.arrangement_repeat
+        })
+    }
+
+    /// Append entry to arrangement
+    pub fn append_arrangement(&self, pattern: usize, repeats: usize) -> Value {
+        if pattern >= NUM_PATTERNS {
+            return json!({ "status": "error", "message": "Pattern must be 0-15" });
+        }
+        let repeats = repeats.clamp(1, 16);
+        self.dispatch(Command::AppendArrangement { pattern, repeats });
+        json!({
+            "status": "ok",
+            "message": format!("Appended pattern {:02} x{} to arrangement", pattern, repeats)
+        })
+    }
+
+    /// Insert entry into arrangement
+    pub fn insert_arrangement(&self, position: usize, pattern: usize, repeats: usize) -> Value {
+        if pattern >= NUM_PATTERNS {
+            return json!({ "status": "error", "message": "Pattern must be 0-15" });
+        }
+        let state = self.sequencer_state.read();
+        if position > state.arrangement.len() {
+            return json!({ "status": "error", "message": "Position out of range" });
+        }
+        drop(state);
+        let repeats = repeats.clamp(1, 16);
+        self.dispatch(Command::InsertArrangement {
+            position,
+            pattern,
+            repeats,
+        });
+        json!({
+            "status": "ok",
+            "message": format!("Inserted pattern {:02} x{} at position {}", pattern, repeats, position)
+        })
+    }
+
+    /// Remove entry from arrangement
+    pub fn remove_arrangement(&self, position: usize) -> Value {
+        let state = self.sequencer_state.read();
+        if position >= state.arrangement.len() {
+            return json!({ "status": "error", "message": "Position out of range" });
+        }
+        drop(state);
+        self.dispatch(Command::RemoveArrangement(position));
+        json!({
+            "status": "ok",
+            "message": format!("Removed arrangement entry at position {}", position)
+        })
+    }
+
+    /// Modify an arrangement entry
+    pub fn set_arrangement_entry(&self, position: usize, pattern: usize, repeats: usize) -> Value {
+        if pattern >= NUM_PATTERNS {
+            return json!({ "status": "error", "message": "Pattern must be 0-15" });
+        }
+        let state = self.sequencer_state.read();
+        if position >= state.arrangement.len() {
+            return json!({ "status": "error", "message": "Position out of range" });
+        }
+        drop(state);
+        let repeats = repeats.clamp(1, 16);
+        self.dispatch(Command::SetArrangementEntry {
+            position,
+            pattern,
+            repeats,
+        });
+        json!({
+            "status": "ok",
+            "message": format!("Set entry {} to pattern {:02} x{}", position, pattern, repeats)
+        })
+    }
+
+    /// Clear arrangement
+    pub fn clear_arrangement(&self) -> Value {
+        self.dispatch(Command::ClearArrangement);
+        json!({
+            "status": "ok",
+            "message": "Cleared arrangement"
+        })
+    }
+
     /// Handle an MCP tool call
     pub fn handle_tool_call(&self, tool: &str, args: &Value) -> Value {
         match tool {
             // Transport
             "play" => self.play(),
+            "pause" => self.pause(),
             "stop" => self.stop(),
             "set_bpm" => {
                 let bpm = args.get("bpm").and_then(|v| v.as_f64()).unwrap_or(120.0) as f32;
@@ -636,7 +855,10 @@ impl GridoxideMcp {
                 let note = args.get("note").and_then(|v| v.as_u64()).map(|n| n as u8);
                 self.toggle_step(track, step, note)
             }
-            "get_pattern" => self.get_pattern(),
+            "get_pattern" => {
+                let pattern_index = args.get("pattern").and_then(|v| v.as_u64()).map(|n| n as usize);
+                self.get_pattern(pattern_index)
+            }
             "set_step_note" => {
                 let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let step = args.get("step").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -726,6 +948,51 @@ impl GridoxideMcp {
             }
             "toggle_master_fx" => self.toggle_master_fx(),
 
+            // Pattern Bank
+            "select_pattern" => {
+                let pattern = args.get("pattern").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                self.select_pattern(pattern)
+            }
+            "get_pattern_bank" => self.get_pattern_bank(),
+            "copy_pattern" => {
+                let src = args.get("src").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let dst = args.get("dst").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                self.copy_pattern(src, dst)
+            }
+            "clear_pattern" => {
+                let pattern = args.get("pattern").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                self.clear_pattern(pattern)
+            }
+            "set_playback_mode" => {
+                let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("pattern");
+                self.set_playback_mode(mode)
+            }
+
+            // Arrangement
+            "get_arrangement" => self.get_arrangement(),
+            "append_arrangement" => {
+                let pattern = args.get("pattern").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let repeats = args.get("repeats").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                self.append_arrangement(pattern, repeats)
+            }
+            "insert_arrangement" => {
+                let position = args.get("position").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let pattern = args.get("pattern").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let repeats = args.get("repeats").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                self.insert_arrangement(position, pattern, repeats)
+            }
+            "remove_arrangement" => {
+                let position = args.get("position").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                self.remove_arrangement(position)
+            }
+            "set_arrangement_entry" => {
+                let position = args.get("position").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let pattern = args.get("pattern").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let repeats = args.get("repeats").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                self.set_arrangement_entry(position, pattern, repeats)
+            }
+            "clear_arrangement" => self.clear_arrangement(),
+
             _ => json!({ "status": "error", "message": format!("Unknown tool: {}", tool) }),
         }
     }
@@ -737,6 +1004,14 @@ impl GridoxideMcp {
                 {
                     "name": "play",
                     "description": "Start playback",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "pause",
+                    "description": "Pause playback, keeping the current step position.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
@@ -766,7 +1041,7 @@ impl GridoxideMcp {
                 },
                 {
                     "name": "get_state",
-                    "description": "Get current transport state (playing, bpm, current_step)",
+                    "description": "Get current transport state (playing, bpm, current_step, current_pattern, playback_mode, arrangement_position)",
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
@@ -796,10 +1071,15 @@ impl GridoxideMcp {
                 },
                 {
                     "name": "get_pattern",
-                    "description": "Get the full pattern grid showing all tracks and steps",
+                    "description": "Get the full pattern grid showing all tracks and steps. Optionally specify a pattern slot (0-15) to view.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {}
+                        "properties": {
+                            "pattern": {
+                                "type": "integer",
+                                "description": "Optional pattern slot index (0-15). If omitted, returns the active pattern."
+                            }
+                        }
                     }
                 },
                 {
@@ -1092,6 +1372,166 @@ impl GridoxideMcp {
                 {
                     "name": "toggle_master_fx",
                     "description": "Toggle master reverb on/off.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "select_pattern",
+                    "description": "Switch the active pattern slot (0-15). When playing, the switch happens at the next pattern boundary.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "pattern": {
+                                "type": "integer",
+                                "description": "Pattern slot index (0-15)"
+                            }
+                        },
+                        "required": ["pattern"]
+                    }
+                },
+                {
+                    "name": "get_pattern_bank",
+                    "description": "Get an overview of all 16 pattern slots showing which have active steps.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "copy_pattern",
+                    "description": "Copy a pattern from one slot to another.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "src": {
+                                "type": "integer",
+                                "description": "Source pattern slot (0-15)"
+                            },
+                            "dst": {
+                                "type": "integer",
+                                "description": "Destination pattern slot (0-15)"
+                            }
+                        },
+                        "required": ["src", "dst"]
+                    }
+                },
+                {
+                    "name": "clear_pattern",
+                    "description": "Clear all tracks in a pattern slot.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "pattern": {
+                                "type": "integer",
+                                "description": "Pattern slot index (0-15)"
+                            }
+                        },
+                        "required": ["pattern"]
+                    }
+                },
+                {
+                    "name": "set_playback_mode",
+                    "description": "Switch between pattern mode (loop single pattern) and song mode (play through arrangement).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "mode": {
+                                "type": "string",
+                                "description": "Playback mode: 'pattern' or 'song'"
+                            }
+                        },
+                        "required": ["mode"]
+                    }
+                },
+                {
+                    "name": "get_arrangement",
+                    "description": "Get the full arrangement (list of pattern entries with repeat counts).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "append_arrangement",
+                    "description": "Add a pattern entry to the end of the arrangement.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "pattern": {
+                                "type": "integer",
+                                "description": "Pattern slot index (0-15)"
+                            },
+                            "repeats": {
+                                "type": "integer",
+                                "description": "Number of times to repeat (1-16, default: 1)"
+                            }
+                        },
+                        "required": ["pattern"]
+                    }
+                },
+                {
+                    "name": "insert_arrangement",
+                    "description": "Insert a pattern entry at a specific position in the arrangement.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "position": {
+                                "type": "integer",
+                                "description": "Position to insert at (0-based)"
+                            },
+                            "pattern": {
+                                "type": "integer",
+                                "description": "Pattern slot index (0-15)"
+                            },
+                            "repeats": {
+                                "type": "integer",
+                                "description": "Number of times to repeat (1-16, default: 1)"
+                            }
+                        },
+                        "required": ["position", "pattern"]
+                    }
+                },
+                {
+                    "name": "remove_arrangement",
+                    "description": "Remove an entry from the arrangement by position.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "position": {
+                                "type": "integer",
+                                "description": "Position to remove (0-based)"
+                            }
+                        },
+                        "required": ["position"]
+                    }
+                },
+                {
+                    "name": "set_arrangement_entry",
+                    "description": "Modify an existing arrangement entry's pattern and repeat count.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "position": {
+                                "type": "integer",
+                                "description": "Position to modify (0-based)"
+                            },
+                            "pattern": {
+                                "type": "integer",
+                                "description": "Pattern slot index (0-15)"
+                            },
+                            "repeats": {
+                                "type": "integer",
+                                "description": "Number of times to repeat (1-16)"
+                            }
+                        },
+                        "required": ["position", "pattern", "repeats"]
+                    }
+                },
+                {
+                    "name": "clear_arrangement",
+                    "description": "Remove all entries from the arrangement.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {}

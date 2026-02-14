@@ -8,6 +8,7 @@ pub struct Clock {
     sample_counter: f32,
     current_step: usize,
     playing: bool,
+    pattern_wrapped: bool,
 }
 
 impl Clock {
@@ -19,6 +20,7 @@ impl Clock {
             sample_counter: 0.0,
             current_step: 0,
             playing: false,
+            pattern_wrapped: false,
         };
         clock.recalculate_timing();
         clock
@@ -61,9 +63,19 @@ impl Clock {
             self.sample_counter -= self.samples_per_step;
             let step = self.current_step;
             self.current_step = (self.current_step + 1) % STEPS;
+            if self.current_step == 0 {
+                self.pattern_wrapped = true;
+            }
             return Some(step);
         }
         None
+    }
+
+    /// Returns true if the pattern wrapped since last call, and clears the flag.
+    pub fn take_pattern_wrap(&mut self) -> bool {
+        let wrapped = self.pattern_wrapped;
+        self.pattern_wrapped = false;
+        wrapped
     }
 
     pub fn play(&mut self) {
@@ -78,6 +90,7 @@ impl Clock {
         self.playing = false;
         self.current_step = 0;
         self.sample_counter = 0.0;
+        self.pattern_wrapped = false;
     }
 
     pub fn pause(&mut self) {
