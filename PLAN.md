@@ -41,7 +41,7 @@ Core principle: **full parity between TUI and MCP** via unified command bus. Eve
 | 2 | Grid sequencer | Step grid, clock, patterns, play/stop, MCP transport+pattern | **COMPLETE** |
 | 3 | Sound shaping | Synth parameters, TUI editor, MCP track control | **COMPLETE** |
 | 4 | Mixing | Volume, pan, mute/solo, mixer view, MCP mixer | **COMPLETE** |
-| 4.5 | Per-step notes | Per-step pitch/note data, melodic sequencing, MCP note tools | Planned |
+| 4.5 | Per-step notes | Per-step pitch/note data, melodic sequencing, MCP note tools, TUI+MCP socket bridge | **COMPLETE** |
 | 5 | Effects | FX chains, filter/delay/reverb/distortion, MCP fx | Planned |
 | 6 | Patterns + Arrangement | Multiple patterns, chaining, arrangement view | Planned |
 | 7 | Project I/O | Save/load JSON, export WAV | Planned |
