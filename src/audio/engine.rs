@@ -6,6 +6,9 @@ use cpal::{Device, SampleFormat, Stream, StreamConfig};
 use parking_lot::RwLock;
 
 use crate::command::{Command, CommandReceiver};
+use crate::fx::{
+    FxParamId, FxType, MasterFxParamId, MasterFxState, StereoReverb, TrackFxChain, TrackFxState,
+};
 use crate::sequencer::{Clock, Pattern};
 use crate::synth::{
     BassParams, BassSynth, HiHatParams, HiHatSynth, KickParams, KickSynth, ParamId, SnareParams,
@@ -29,6 +32,9 @@ pub struct SequencerState {
     pub track_pans: [f32; 4],
     pub track_mutes: [bool; 4],
     pub track_solos: [bool; 4],
+    // FX state
+    pub track_fx: [TrackFxState; 4],
+    pub master_fx: MasterFxState,
 }
 
 impl SequencerState {
@@ -46,6 +52,13 @@ impl SequencerState {
             track_pans: [0.0; 4],
             track_mutes: [false; 4],
             track_solos: [false; 4],
+            track_fx: [
+                TrackFxState::default(),
+                TrackFxState::default(),
+                TrackFxState::default(),
+                TrackFxState::default(),
+            ],
+            master_fx: MasterFxState::default(),
         }
     }
 }
@@ -124,6 +137,27 @@ impl AudioEngine {
         let mut local_pans = [0.0f32; 4];
         let mut local_mutes = [false; 4];
         let mut local_solos = [false; 4];
+
+        // Per-track FX chains
+        let mut fx_chains = [
+            TrackFxChain::new(sample_rate),
+            TrackFxChain::new(sample_rate),
+            TrackFxChain::new(sample_rate),
+            TrackFxChain::new(sample_rate),
+        ];
+
+        // Local FX state for syncing to shared state
+        let mut local_track_fx = [
+            TrackFxState::default(),
+            TrackFxState::default(),
+            TrackFxState::default(),
+            TrackFxState::default(),
+        ];
+        let mut local_master_fx = MasterFxState::default();
+
+        // Master reverb
+        let mut reverb = StereoReverb::new(sample_rate);
+        let mut reverb_enabled = false;
 
         // For periodic state sync
         let mut sync_counter = 0usize;
@@ -247,6 +281,60 @@ impl AudioEngine {
                                 }
                             }
                         }
+                        // Per-track FX commands
+                        Command::SetFxParam { track, param, value } => {
+                            if track < 4 {
+                                apply_fx_param(&mut fx_chains[track], &mut local_track_fx[track], param, value);
+                                if let Some(mut state) = state.try_write() {
+                                    state.track_fx[track] = local_track_fx[track].clone();
+                                }
+                            }
+                        }
+                        Command::SetFxFilterType { track, filter_type } => {
+                            if track < 4 {
+                                fx_chains[track].filter.set_filter_type(filter_type);
+                                local_track_fx[track].filter_type = filter_type;
+                                if let Some(mut state) = state.try_write() {
+                                    state.track_fx[track].filter_type = filter_type;
+                                }
+                            }
+                        }
+                        Command::ToggleFxEnabled { track, fx } => {
+                            if track < 4 {
+                                match fx {
+                                    FxType::Filter => {
+                                        fx_chains[track].filter_enabled = !fx_chains[track].filter_enabled;
+                                        local_track_fx[track].filter_enabled = fx_chains[track].filter_enabled;
+                                    }
+                                    FxType::Distortion => {
+                                        fx_chains[track].dist_enabled = !fx_chains[track].dist_enabled;
+                                        local_track_fx[track].dist_enabled = fx_chains[track].dist_enabled;
+                                    }
+                                    FxType::Delay => {
+                                        fx_chains[track].delay_enabled = !fx_chains[track].delay_enabled;
+                                        local_track_fx[track].delay_enabled = fx_chains[track].delay_enabled;
+                                    }
+                                }
+                                if let Some(mut state) = state.try_write() {
+                                    state.track_fx[track] = local_track_fx[track].clone();
+                                }
+                            }
+                        }
+                        // Master FX commands
+                        Command::SetMasterFxParam { param, value } => {
+                            apply_master_fx_param(&mut reverb, &mut local_master_fx, param, value);
+                            reverb_enabled = local_master_fx.reverb_enabled;
+                            if let Some(mut state) = state.try_write() {
+                                state.master_fx = local_master_fx.clone();
+                            }
+                        }
+                        Command::ToggleMasterFxEnabled => {
+                            reverb_enabled = !reverb_enabled;
+                            local_master_fx.reverb_enabled = reverb_enabled;
+                            if let Some(mut state) = state.try_write() {
+                                state.master_fx.reverb_enabled = reverb_enabled;
+                            }
+                        }
                     }
                 }
 
@@ -273,13 +361,15 @@ impl AudioEngine {
                         }
                     }
 
-                    // Mix all synths with per-track volume, pan, mute, solo
+                    // Get raw synth output and apply per-track FX
                     let raw = [
-                        kick.next_sample(),
-                        snare.next_sample(),
-                        hihat.next_sample(),
-                        bass.next_sample(),
+                        fx_chains[0].process(kick.next_sample()),
+                        fx_chains[1].process(snare.next_sample()),
+                        fx_chains[2].process(hihat.next_sample()),
+                        fx_chains[3].process(bass.next_sample()),
                     ];
+
+                    // Mix with per-track volume, pan, mute, solo
                     let any_solo = local_solos.iter().any(|&s| s);
 
                     let mut left = 0.0f32;
@@ -298,6 +388,13 @@ impl AudioEngine {
                         let angle = (local_pans[i] + 1.0) * 0.25 * std::f32::consts::PI;
                         left += s * angle.cos();
                         right += s * angle.sin();
+                    }
+
+                    // Master reverb
+                    if reverb_enabled {
+                        let (rl, rr) = reverb.process_stereo(left, right);
+                        left = rl;
+                        right = rr;
                     }
 
                     // Soft clip both channels
@@ -333,6 +430,68 @@ impl AudioEngine {
         )?;
 
         Ok(stream)
+    }
+}
+
+/// Apply a per-track FX parameter change
+fn apply_fx_param(chain: &mut TrackFxChain, local: &mut TrackFxState, param: FxParamId, value: f32) {
+    match param {
+        FxParamId::FilterCutoff => {
+            let v = value.clamp(20.0, 20000.0);
+            chain.filter.set_cutoff(v);
+            local.filter_cutoff = v;
+        }
+        FxParamId::FilterResonance => {
+            let v = value.clamp(0.0, 0.95);
+            chain.filter.set_resonance(v);
+            local.filter_resonance = v;
+        }
+        FxParamId::DistDrive => {
+            let v = value.clamp(0.0, 1.0);
+            chain.distortion.set_drive(v);
+            local.dist_drive = v;
+        }
+        FxParamId::DistMix => {
+            let v = value.clamp(0.0, 1.0);
+            chain.distortion.set_mix(v);
+            local.dist_mix = v;
+        }
+        FxParamId::DelayTime => {
+            let v = value.clamp(10.0, 500.0);
+            chain.delay.set_time(v);
+            local.delay_time = v;
+        }
+        FxParamId::DelayFeedback => {
+            let v = value.clamp(0.0, 0.9);
+            chain.delay.set_feedback(v);
+            local.delay_feedback = v;
+        }
+        FxParamId::DelayMix => {
+            let v = value.clamp(0.0, 1.0);
+            chain.delay.set_mix(v);
+            local.delay_mix = v;
+        }
+    }
+}
+
+/// Apply a master FX parameter change
+fn apply_master_fx_param(reverb: &mut StereoReverb, local: &mut MasterFxState, param: MasterFxParamId, value: f32) {
+    match param {
+        MasterFxParamId::ReverbDecay => {
+            let v = value.clamp(0.1, 0.95);
+            reverb.set_decay(v);
+            local.reverb_decay = v;
+        }
+        MasterFxParamId::ReverbMix => {
+            let v = value.clamp(0.0, 1.0);
+            reverb.set_mix(v);
+            local.reverb_mix = v;
+        }
+        MasterFxParamId::ReverbDamping => {
+            let v = value.clamp(0.0, 1.0);
+            reverb.set_damping(v);
+            local.reverb_damping = v;
+        }
     }
 }
 

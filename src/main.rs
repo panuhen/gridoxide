@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod command;
 mod event;
+mod fx;
 mod mcp;
 mod sequencer;
 mod synth;

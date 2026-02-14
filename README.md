@@ -8,7 +8,7 @@ Gridoxide is a terminal EDM production studio designed for collaborative use bet
 
 When the TUI is running, an MCP socket bridge at `/tmp/gridoxide.sock` allows Claude to control the same session in real time - changes from MCP appear live in the grid.
 
-## Current Status: Phase 4.5
+## Current Status: Phase 5
 
 - 4 tracks: Kick, Snare, Hi-hat, Bass
 - 16-step pattern grid with per-step MIDI notes (0-127)
@@ -16,6 +16,10 @@ When the TUI is running, an MCP socket bridge at `/tmp/gridoxide.sock` allows Cl
 - Grid view with note names on active steps
 - Parameter editor (Params view)
 - Mixer with volume, pan, mute/solo (Mixer view)
+- Per-track FX chains: filter (LP/HP/BP), distortion (tanh), delay (ring buffer)
+- Master bus reverb (Schroeder)
+- FX view for real-time effect tweaking
+- Signal chain: Synth → [Filter → Distortion → Delay] → Volume → Pan → Sum → [Reverb] → Soft Clip
 - Real-time synth parameter tweaking
 - BPM clock with play/stop
 - Command bus architecture
@@ -91,7 +95,25 @@ gridoxide --mcp
 | O | Toggle solo |
 | P | Play/Stop toggle |
 | S | Stop |
-| Tab / Esc | Back to Grid view |
+| Tab | Switch to FX view |
+| Esc | Back to Grid view |
+| Q | Quit |
+
+### FX View
+| Key | Action |
+|-----|--------|
+| 1-4 | Select track |
+| Up/Down / jk | Select parameter |
+| Left/Right / hl | Adjust value (fine ±5%) |
+| [ / ] | Adjust value (coarse ±20%) |
+| F | Toggle filter on/off |
+| D | Toggle distortion on/off |
+| Y | Toggle delay on/off |
+| R | Toggle master reverb on/off |
+| P | Play/Stop toggle |
+| S | Stop |
+| Tab | Back to Grid view |
+| Esc | Back to Grid view |
 | Q | Quit |
 
 ## MCP Tools
@@ -127,6 +149,16 @@ When running with `--mcp`, gridoxide exposes these tools. If the TUI is running,
 - `toggle_mute` - Toggle track mute
 - `toggle_solo` - Toggle track solo
 
+**Per-Track FX:**
+- `get_fx_params` - Get all FX parameters for a track (filter, distortion, delay)
+- `set_fx_param` - Set an FX parameter (e.g., `filter_cutoff`, `dist_drive`, `delay_time`)
+- `toggle_fx` - Toggle an effect on/off (`filter`, `distortion`, or `delay`)
+
+**Master FX:**
+- `get_master_fx_params` - Get master bus FX parameters (reverb)
+- `set_master_fx_param` - Set a master FX parameter (`reverb_decay`, `reverb_mix`, `reverb_damping`)
+- `toggle_master_fx` - Toggle master reverb on/off
+
 **Events:**
 - `get_events` - Get recent events (for "listening" to human actions)
 
@@ -159,7 +191,7 @@ When the TUI is running, it opens a Unix socket at `/tmp/gridoxide.sock`. The `-
 | 3 | Sound shaping | Complete |
 | 4 | Mixing | Complete |
 | 4.5 | Per-step notes | **Complete** |
-| 5 | Effects | Planned |
+| 5 | Effects | **Complete** |
 | 6 | Patterns + Arrangement | Planned |
 | 7 | Project I/O | Planned |
 | 8 | MIDI | Planned |

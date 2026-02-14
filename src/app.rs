@@ -17,10 +17,11 @@ use ratatui::Terminal;
 use crate::audio::{AudioEngine, SequencerState};
 use crate::command::{Command, CommandBus, CommandSender, CommandSource};
 use crate::event::EventLog;
+use crate::fx::{FilterType, FxParamId, FxType, MasterFxParamId};
 use crate::mcp::{start_socket_server, GridoxideMcp};
 use crate::ui::{
-    get_param_value, render_grid, render_mixer, render_params, render_transport, GridState,
-    MixerField, MixerState, ParamEditorState, Theme,
+    get_param_value, render_fx, render_grid, render_mixer, render_params, render_transport,
+    FxEditorState, GridState, MixerField, MixerState, ParamEditorState, Theme,
 };
 
 /// Current UI view
@@ -29,6 +30,7 @@ pub enum View {
     Grid,
     Params,
     Mixer,
+    Fx,
 }
 
 /// Application state
@@ -49,6 +51,8 @@ pub struct App {
     param_editor: ParamEditorState,
     /// Mixer state
     mixer_state: MixerState,
+    /// FX editor state
+    fx_editor: FxEditorState,
     /// Current view
     view: View,
     /// Whether the app should quit
@@ -90,6 +94,7 @@ impl App {
             grid_state: GridState::new(),
             param_editor: ParamEditorState::new(),
             mixer_state: MixerState::new(),
+            fx_editor: FxEditorState::new(),
             view: View::Grid,
             should_quit: false,
             mcp_shutdown,
@@ -180,6 +185,7 @@ impl App {
             View::Grid => self.handle_grid_key(key),
             View::Params => self.handle_params_key(key),
             View::Mixer => self.handle_mixer_key(key),
+            View::Fx => self.handle_fx_key(key),
         }
     }
 
@@ -349,8 +355,11 @@ impl App {
                 self.should_quit = true;
             }
 
-            // Cycle to grid view (Esc also goes back to grid)
-            KeyCode::Tab | KeyCode::Esc => {
+            // Tab cycles to FX view, Esc goes back to grid
+            KeyCode::Tab => {
+                self.view = View::Fx;
+            }
+            KeyCode::Esc => {
                 self.view = View::Grid;
             }
 
@@ -400,6 +409,158 @@ impl App {
             }
 
             _ => {}
+        }
+    }
+
+    /// Handle keys in FX view
+    fn handle_fx_key(&mut self, key: KeyCode) {
+        match key {
+            // Quit
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+            }
+
+            // Tab cycles to Grid, Esc goes back to grid
+            KeyCode::Tab => {
+                self.view = View::Grid;
+            }
+            KeyCode::Esc => {
+                self.view = View::Grid;
+            }
+
+            // Select track
+            KeyCode::Char('1') => self.fx_editor.select_track(0),
+            KeyCode::Char('2') => self.fx_editor.select_track(1),
+            KeyCode::Char('3') => self.fx_editor.select_track(2),
+            KeyCode::Char('4') => self.fx_editor.select_track(3),
+            KeyCode::Char('5') | KeyCode::Char('m') => self.fx_editor.select_track(4),
+
+            // Navigate params
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.fx_editor.move_selection(-1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.fx_editor.move_selection(1);
+            }
+
+            // Adjust value (fine)
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.adjust_fx_param(-0.05);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.adjust_fx_param(0.05);
+            }
+
+            // Adjust value (coarse)
+            KeyCode::Char('[') => {
+                self.adjust_fx_param(-0.2);
+            }
+            KeyCode::Char(']') => {
+                self.adjust_fx_param(0.2);
+            }
+
+            // Toggle effect enabled (Enter/Space)
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.toggle_current_fx();
+            }
+
+            // Play/Stop
+            KeyCode::Char('p') => {
+                let playing = self.sequencer_state.read().playing;
+                if playing {
+                    self.dispatch(Command::Stop);
+                } else {
+                    self.dispatch(Command::Play);
+                }
+            }
+            KeyCode::Char('s') => {
+                self.dispatch(Command::Stop);
+            }
+
+            _ => {}
+        }
+    }
+
+    /// Toggle the FX effect that the cursor is currently in
+    fn toggle_current_fx(&mut self) {
+        if self.fx_editor.track == 4 {
+            // Master: toggle reverb
+            self.dispatch(Command::ToggleMasterFxEnabled);
+        } else {
+            let track = self.fx_editor.track;
+            let (section, _) = self.fx_editor.current_section_and_param();
+            let fx = match section {
+                0 => FxType::Filter,
+                1 => FxType::Distortion,
+                2 => FxType::Delay,
+                _ => return,
+            };
+            self.dispatch(Command::ToggleFxEnabled { track, fx });
+        }
+    }
+
+    /// Adjust the currently selected FX parameter
+    fn adjust_fx_param(&mut self, delta_normalized: f32) {
+        if self.fx_editor.track == 4 {
+            // Master FX
+            let params = MasterFxParamId::all();
+            if self.fx_editor.param_index >= params.len() {
+                return;
+            }
+            let param = params[self.fx_editor.param_index];
+            let (min, max, _default) = param.range();
+            let current = crate::ui::fx::get_master_fx_param_value(
+                &self.sequencer_state.read(),
+                param,
+            );
+            let new_value = (current + delta_normalized * (max - min)).clamp(min, max);
+            self.dispatch(Command::SetMasterFxParam {
+                param,
+                value: new_value,
+            });
+        } else {
+            let track = self.fx_editor.track;
+            let (section, local_idx) = self.fx_editor.current_section_and_param();
+
+            // Filter type is special: cycle through LP/HP/BP
+            if section == 0 && local_idx == 0 {
+                let state = self.sequencer_state.read();
+                let current_type = state.track_fx[track].filter_type;
+                drop(state);
+                let dir = if delta_normalized > 0.0 { 1i32 } else { -1i32 };
+                let new_idx = (current_type.index() as i32 + dir).rem_euclid(3) as usize;
+                let new_type = FilterType::from_index(new_idx);
+                self.dispatch(Command::SetFxFilterType {
+                    track,
+                    filter_type: new_type,
+                });
+                return;
+            }
+
+            // Map (section, local_idx) to FxParamId
+            let param = match (section, local_idx) {
+                (0, 1) => FxParamId::FilterCutoff,
+                (0, 2) => FxParamId::FilterResonance,
+                (1, 0) => FxParamId::DistDrive,
+                (1, 1) => FxParamId::DistMix,
+                (2, 0) => FxParamId::DelayTime,
+                (2, 1) => FxParamId::DelayFeedback,
+                (2, 2) => FxParamId::DelayMix,
+                _ => return,
+            };
+
+            let (min, max, _default) = param.range();
+            let current = crate::ui::fx::get_fx_param_value(
+                &self.sequencer_state.read(),
+                track,
+                param,
+            );
+            let new_value = (current + delta_normalized * (max - min)).clamp(min, max);
+            self.dispatch(Command::SetFxParam {
+                track,
+                param,
+                value: new_value,
+            });
         }
     }
 
@@ -536,6 +697,9 @@ impl App {
             View::Mixer => {
                 render_mixer(frame, chunks[2], &state, &self.mixer_state, &self.theme);
             }
+            View::Fx => {
+                render_fx(frame, chunks[2], &state, &self.fx_editor, &self.theme);
+            }
         }
 
         self.render_footer(frame, chunks[3]);
@@ -547,6 +711,7 @@ impl App {
             View::Grid => "[GRID]",
             View::Params => "[PARAMS]",
             View::Mixer => "[MIXER]",
+            View::Fx => "[FX]",
         };
         let title = format!(
             " GRIDOXIDE v{} {} ",
@@ -582,7 +747,11 @@ impl App {
                 self.theme.name
             ),
             View::Mixer => format!(
-                "1-4:Track | Up/Down:Field | Left/Right:Adjust | M:Mute | O:Solo | TAB:Grid | Q:Quit | {}",
+                "1-4:Track | Up/Down:Field | Left/Right:Adjust | M:Mute | O:Solo | TAB:FX | Q:Quit | {}",
+                self.theme.name
+            ),
+            View::Fx => format!(
+                "1-5:Track/Master | Up/Down:Select | Left/Right:Adjust | SPACE:Toggle FX | TAB:Grid | Q:Quit | {}",
                 self.theme.name
             ),
         };

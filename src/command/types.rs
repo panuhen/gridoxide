@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::fx::{FilterType, FxParamId, FxType, MasterFxParamId};
 use crate::synth::{BassParams, HiHatParams, KickParams, ParamId, SnareParams};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +38,15 @@ pub enum Command {
     SetTrackPan { track: usize, pan: f32 },
     ToggleMute(usize),
     ToggleSolo(usize),
+
+    // Per-track FX
+    SetFxParam { track: usize, param: FxParamId, value: f32 },
+    SetFxFilterType { track: usize, filter_type: FilterType },
+    ToggleFxEnabled { track: usize, fx: FxType },
+
+    // Master FX
+    SetMasterFxParam { param: MasterFxParamId, value: f32 },
+    ToggleMasterFxEnabled,
 }
 
 impl Command {
@@ -75,6 +85,19 @@ impl Command {
             }
             Command::ToggleMute(track) => format!("Toggle mute track {}", track),
             Command::ToggleSolo(track) => format!("Toggle solo track {}", track),
+            Command::SetFxParam { track, param, value } => {
+                format!("Set track {} FX {} to {:.2}", track, param.name(), value)
+            }
+            Command::SetFxFilterType { track, filter_type } => {
+                format!("Set track {} filter type to {}", track, filter_type.name())
+            }
+            Command::ToggleFxEnabled { track, fx } => {
+                format!("Toggle {} on track {}", fx.name(), track)
+            }
+            Command::SetMasterFxParam { param, value } => {
+                format!("Set master {} to {:.2}", param.name(), value)
+            }
+            Command::ToggleMasterFxEnabled => "Toggle master reverb".to_string(),
         }
     }
 }

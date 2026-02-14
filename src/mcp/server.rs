@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use crate::audio::SequencerState;
 use crate::command::{Command, CommandSender, CommandSource};
 use crate::event::EventLog;
+use crate::fx::{FilterType, FxParamId, FxType, MasterFxParamId};
 use crate::sequencer::TrackType;
 use crate::synth::{note_name, BassParams, HiHatParams, KickParams, ParamId, SnareParams, DEFAULT_NOTES};
 use crate::ui::get_param_value;
@@ -436,6 +437,186 @@ impl GridoxideMcp {
         })
     }
 
+    // === FX Tools ===
+
+    /// Get all FX parameters for a track
+    pub fn get_fx_params(&self, track: usize) -> Value {
+        if track >= 4 {
+            return json!({ "status": "error", "message": "Track must be 0-3" });
+        }
+
+        let state = self.sequencer_state.read();
+        let track_name = TrackType::from_index(track)
+            .map(|t| t.name())
+            .unwrap_or("unknown");
+        let fx = &state.track_fx[track];
+
+        json!({
+            "track": track,
+            "name": track_name,
+            "filter": {
+                "enabled": fx.filter_enabled,
+                "type": fx.filter_type.name(),
+                "cutoff": fx.filter_cutoff,
+                "cutoff_range": [20.0, 20000.0],
+                "resonance": fx.filter_resonance,
+                "resonance_range": [0.0, 0.95]
+            },
+            "distortion": {
+                "enabled": fx.dist_enabled,
+                "drive": fx.dist_drive,
+                "drive_range": [0.0, 1.0],
+                "mix": fx.dist_mix,
+                "mix_range": [0.0, 1.0]
+            },
+            "delay": {
+                "enabled": fx.delay_enabled,
+                "time": fx.delay_time,
+                "time_range": [10.0, 500.0],
+                "feedback": fx.delay_feedback,
+                "feedback_range": [0.0, 0.9],
+                "mix": fx.delay_mix,
+                "mix_range": [0.0, 1.0]
+            }
+        })
+    }
+
+    /// Set a per-track FX parameter
+    pub fn set_fx_param(&self, track: usize, param_key: &str, value: f32) -> Value {
+        if track >= 4 {
+            return json!({ "status": "error", "message": "Track must be 0-3" });
+        }
+
+        // Handle filter type specially
+        if param_key == "filter_type" {
+            let ft = match value as usize {
+                0 => FilterType::LowPass,
+                1 => FilterType::HighPass,
+                2 => FilterType::BandPass,
+                _ => return json!({ "status": "error", "message": "Filter type must be 0 (LP), 1 (HP), or 2 (BP)" }),
+            };
+            self.dispatch(Command::SetFxFilterType { track, filter_type: ft });
+            return json!({
+                "status": "ok",
+                "track": track,
+                "param": "filter_type",
+                "value": ft.name()
+            });
+        }
+
+        let param = match FxParamId::from_key(param_key) {
+            Some(p) => p,
+            None => {
+                return json!({
+                    "status": "error",
+                    "message": format!("Unknown FX parameter: {}. Valid: filter_cutoff, filter_resonance, filter_type, dist_drive, dist_mix, delay_time, delay_feedback, delay_mix", param_key)
+                })
+            }
+        };
+
+        let (min, max, _default) = param.range();
+        let clamped = value.clamp(min, max);
+
+        self.dispatch(Command::SetFxParam { track, param, value: clamped });
+
+        json!({
+            "status": "ok",
+            "track": track,
+            "param": param_key,
+            "name": param.name(),
+            "value": clamped,
+            "min": min,
+            "max": max
+        })
+    }
+
+    /// Toggle a per-track FX on/off
+    pub fn toggle_fx(&self, track: usize, fx_name: &str) -> Value {
+        if track >= 4 {
+            return json!({ "status": "error", "message": "Track must be 0-3" });
+        }
+
+        let fx = match fx_name {
+            "filter" => FxType::Filter,
+            "distortion" | "dist" => FxType::Distortion,
+            "delay" => FxType::Delay,
+            _ => {
+                return json!({
+                    "status": "error",
+                    "message": format!("Unknown FX type: {}. Valid: filter, distortion, delay", fx_name)
+                })
+            }
+        };
+
+        self.dispatch(Command::ToggleFxEnabled { track, fx });
+
+        let track_name = TrackType::from_index(track)
+            .map(|t| t.name())
+            .unwrap_or("unknown");
+
+        json!({
+            "status": "ok",
+            "track": track,
+            "track_name": track_name,
+            "fx": fx.name(),
+            "message": format!("Toggled {} on {}", fx.name(), track_name)
+        })
+    }
+
+    /// Get master FX (reverb) parameters
+    pub fn get_master_fx_params(&self) -> Value {
+        let state = self.sequencer_state.read();
+        let mfx = &state.master_fx;
+
+        json!({
+            "reverb": {
+                "enabled": mfx.reverb_enabled,
+                "decay": mfx.reverb_decay,
+                "decay_range": [0.1, 0.95],
+                "mix": mfx.reverb_mix,
+                "mix_range": [0.0, 1.0],
+                "damping": mfx.reverb_damping,
+                "damping_range": [0.0, 1.0]
+            }
+        })
+    }
+
+    /// Set a master FX parameter
+    pub fn set_master_fx_param(&self, param_key: &str, value: f32) -> Value {
+        let param = match MasterFxParamId::from_key(param_key) {
+            Some(p) => p,
+            None => {
+                return json!({
+                    "status": "error",
+                    "message": format!("Unknown master FX parameter: {}. Valid: reverb_decay, reverb_mix, reverb_damping", param_key)
+                })
+            }
+        };
+
+        let (min, max, _default) = param.range();
+        let clamped = value.clamp(min, max);
+
+        self.dispatch(Command::SetMasterFxParam { param, value: clamped });
+
+        json!({
+            "status": "ok",
+            "param": param_key,
+            "name": param.name(),
+            "value": clamped,
+            "min": min,
+            "max": max
+        })
+    }
+
+    /// Toggle master reverb on/off
+    pub fn toggle_master_fx(&self) -> Value {
+        self.dispatch(Command::ToggleMasterFxEnabled);
+        json!({
+            "status": "ok",
+            "message": "Toggled master reverb"
+        })
+    }
+
     /// Handle an MCP tool call
     pub fn handle_tool_call(&self, tool: &str, args: &Value) -> Value {
         match tool {
@@ -520,6 +701,30 @@ impl GridoxideMcp {
                 let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 self.toggle_solo(track)
             }
+
+            // FX
+            "get_fx_params" => {
+                let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                self.get_fx_params(track)
+            }
+            "set_fx_param" => {
+                let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let param = args.get("param").and_then(|v| v.as_str()).unwrap_or("");
+                let value = args.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                self.set_fx_param(track, param, value)
+            }
+            "toggle_fx" => {
+                let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let fx = args.get("fx").and_then(|v| v.as_str()).unwrap_or("");
+                self.toggle_fx(track, fx)
+            }
+            "get_master_fx_params" => self.get_master_fx_params(),
+            "set_master_fx_param" => {
+                let param = args.get("param").and_then(|v| v.as_str()).unwrap_or("");
+                let value = args.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                self.set_master_fx_param(param, value)
+            }
+            "toggle_master_fx" => self.toggle_master_fx(),
 
             _ => json!({ "status": "error", "message": format!("Unknown tool: {}", tool) }),
         }
@@ -802,6 +1007,94 @@ impl GridoxideMcp {
                             }
                         },
                         "required": ["track"]
+                    }
+                },
+                {
+                    "name": "get_fx_params",
+                    "description": "Get all FX parameters for a track (filter, distortion, delay) with current values and ranges.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "track": {
+                                "type": "integer",
+                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
+                            }
+                        },
+                        "required": ["track"]
+                    }
+                },
+                {
+                    "name": "set_fx_param",
+                    "description": "Set a per-track FX parameter. Params: filter_cutoff (20-20000 Hz), filter_resonance (0-0.95), filter_type (0=LP, 1=HP, 2=BP), dist_drive (0-1), dist_mix (0-1), delay_time (10-500 ms), delay_feedback (0-0.9), delay_mix (0-1).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "track": {
+                                "type": "integer",
+                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
+                            },
+                            "param": {
+                                "type": "string",
+                                "description": "Parameter key (e.g., 'filter_cutoff', 'dist_drive', 'delay_time')"
+                            },
+                            "value": {
+                                "type": "number",
+                                "description": "New value (will be clamped to valid range)"
+                            }
+                        },
+                        "required": ["track", "param", "value"]
+                    }
+                },
+                {
+                    "name": "toggle_fx",
+                    "description": "Toggle a per-track effect on/off. Each track has filter, distortion, and delay (all off by default).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "track": {
+                                "type": "integer",
+                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
+                            },
+                            "fx": {
+                                "type": "string",
+                                "description": "Effect name: 'filter', 'distortion', or 'delay'"
+                            }
+                        },
+                        "required": ["track", "fx"]
+                    }
+                },
+                {
+                    "name": "get_master_fx_params",
+                    "description": "Get master bus FX parameters (reverb) with current values and ranges.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "set_master_fx_param",
+                    "description": "Set a master bus FX parameter. Params: reverb_decay (0.1-0.95), reverb_mix (0-1), reverb_damping (0-1).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "param": {
+                                "type": "string",
+                                "description": "Parameter key: 'reverb_decay', 'reverb_mix', or 'reverb_damping'"
+                            },
+                            "value": {
+                                "type": "number",
+                                "description": "New value (will be clamped to valid range)"
+                            }
+                        },
+                        "required": ["param", "value"]
+                    }
+                },
+                {
+                    "name": "toggle_master_fx",
+                    "description": "Toggle master reverb on/off.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
                     }
                 }
             ]
