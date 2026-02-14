@@ -26,6 +26,9 @@ pub enum Command {
     SetHiHatParams(HiHatParams),
     SetBassParams(BassParams),
 
+    // Per-step note
+    SetStepNote { track: usize, step: usize, note: u8 },
+
     // Single parameter adjustment
     SetParam { param: ParamId, value: f32 },
 
@@ -54,6 +57,9 @@ impl Command {
             }
             Command::ClearTrack(track) => format!("Clear track {}", track),
             Command::FillTrack(track) => format!("Fill track {}", track),
+            Command::SetStepNote { track, step, note } => {
+                format!("Set track {} step {} note to {}", track, step, note)
+            }
             Command::SetKickParams(_) => "Set kick parameters".to_string(),
             Command::SetSnareParams(_) => "Set snare parameters".to_string(),
             Command::SetHiHatParams(_) => "Set hi-hat parameters".to_string(),

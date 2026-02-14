@@ -1,4 +1,4 @@
-use super::params::SnareParams;
+use super::params::{midi_to_freq, SnareParams, DEFAULT_NOTES};
 
 /// Snare drum synthesizer
 /// Mix of noise burst and body tone with fast decay
@@ -9,6 +9,8 @@ pub struct SnareSynth {
     noise_state: u32,
     tone_phase: f32,
     params: SnareParams,
+    /// Tone frequency ratio from note (1.0 = default)
+    tone_ratio: f32,
 }
 
 impl SnareSynth {
@@ -21,6 +23,7 @@ impl SnareSynth {
             noise_state: 12345,
             tone_phase: 0.0,
             params,
+            tone_ratio: 1.0,
         }
     }
 
@@ -37,6 +40,14 @@ impl SnareSynth {
     pub fn trigger(&mut self) {
         self.phase = Some(0);
         self.tone_phase = 0.0;
+        self.tone_ratio = 1.0;
+    }
+
+    /// Trigger with a specific MIDI note (scales tone frequency)
+    pub fn trigger_with_note(&mut self, note: u8) {
+        self.phase = Some(0);
+        self.tone_phase = 0.0;
+        self.tone_ratio = midi_to_freq(note) / midi_to_freq(DEFAULT_NOTES[1]);
     }
 
     /// Simple linear congruential generator for noise
@@ -67,9 +78,9 @@ impl SnareSynth {
             noise = noise * (1.0 + self.params.snappy * 2.0);
         }
 
-        // Body tone with medium decay
+        // Body tone with medium decay, scaled by tone_ratio
         let tone_amp = (-t * self.params.tone_decay).exp();
-        self.tone_phase += self.params.tone_freq / self.sample_rate;
+        self.tone_phase += (self.params.tone_freq * self.tone_ratio) / self.sample_rate;
         if self.tone_phase >= 1.0 {
             self.tone_phase -= 1.0;
         }

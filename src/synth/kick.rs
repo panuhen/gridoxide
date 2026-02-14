@@ -1,4 +1,4 @@
-use super::params::KickParams;
+use super::params::{midi_to_freq, KickParams, DEFAULT_NOTES};
 
 /// Kick drum synthesizer state
 pub struct KickSynth {
@@ -12,6 +12,8 @@ pub struct KickSynth {
     osc_phase: f32,
     /// Synth parameters
     params: KickParams,
+    /// Pitch ratio from note (1.0 = default pitch)
+    pitch_ratio: f32,
 }
 
 impl KickSynth {
@@ -25,6 +27,7 @@ impl KickSynth {
             duration_samples,
             osc_phase: 0.0,
             params,
+            pitch_ratio: 1.0,
         }
     }
 
@@ -45,6 +48,14 @@ impl KickSynth {
     pub fn trigger(&mut self) {
         self.sample_index = Some(0);
         self.osc_phase = 0.0;
+        self.pitch_ratio = 1.0;
+    }
+
+    /// Trigger with a specific MIDI note (scales pitch envelope)
+    pub fn trigger_with_note(&mut self, note: u8) {
+        self.sample_index = Some(0);
+        self.osc_phase = 0.0;
+        self.pitch_ratio = midi_to_freq(note) / midi_to_freq(DEFAULT_NOTES[0]);
     }
 
     /// Generate the next sample
@@ -60,10 +71,11 @@ impl KickSynth {
 
         let t = index as f32 / self.sample_rate;
 
-        // Pitch envelope: exponential decay from pitch_start to pitch_end
-        let freq = self.params.pitch_end
+        // Pitch envelope: exponential decay from pitch_start to pitch_end, scaled by pitch_ratio
+        let freq = (self.params.pitch_end
             + (self.params.pitch_start - self.params.pitch_end)
-                * (-t * self.params.pitch_decay).exp();
+                * (-t * self.params.pitch_decay).exp())
+            * self.pitch_ratio;
 
         // Accumulate phase incrementally
         self.osc_phase += freq / self.sample_rate;

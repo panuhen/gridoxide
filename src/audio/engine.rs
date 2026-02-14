@@ -172,6 +172,12 @@ impl AudioEngine {
                                 state.pattern = pattern.clone();
                             }
                         }
+                        Command::SetStepNote { track, step, note } => {
+                            pattern.set_note(track, step, note);
+                            if let Some(mut state) = state.try_write() {
+                                state.pattern.set_note(track, step, note);
+                            }
+                        }
                         // Synth parameter commands
                         Command::SetKickParams(params) => {
                             kick.set_params(params.clone());
@@ -248,18 +254,22 @@ impl AudioEngine {
                 for frame in data.chunks_mut(channels) {
                     // Check for step trigger
                     if let Some(step) = clock.tick() {
-                        // Trigger synths based on pattern
-                        if pattern.get(0, step) {
-                            kick.trigger();
+                        // Trigger synths based on pattern, passing per-step notes
+                        let s0 = pattern.get_step(0, step);
+                        if s0.active {
+                            kick.trigger_with_note(s0.note);
                         }
-                        if pattern.get(1, step) {
-                            snare.trigger();
+                        let s1 = pattern.get_step(1, step);
+                        if s1.active {
+                            snare.trigger_with_note(s1.note);
                         }
-                        if pattern.get(2, step) {
-                            hihat.trigger();
+                        let s2 = pattern.get_step(2, step);
+                        if s2.active {
+                            hihat.trigger_with_note(s2.note);
                         }
-                        if pattern.get(3, step) {
-                            bass.trigger();
+                        let s3 = pattern.get_step(3, step);
+                        if s3.active {
+                            bass.trigger_with_note(s3.note);
                         }
                     }
 
@@ -304,13 +314,14 @@ impl AudioEngine {
                         *channel_sample = T::from_sample(sample);
                     }
 
-                    // Periodic state sync (for UI to read current_step)
+                    // Periodic state sync (for UI to read current_step + full pattern)
                     sync_counter += 1;
                     if sync_counter >= sync_interval {
                         sync_counter = 0;
                         if let Some(mut state) = state.try_write() {
                             state.current_step = clock.current_step();
                             state.playing = clock.is_playing();
+                            state.pattern = pattern.clone();
                         }
                     }
                 }

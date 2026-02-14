@@ -1,4 +1,5 @@
 use std::io::{self, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ use ratatui::Terminal;
 use crate::audio::{AudioEngine, SequencerState};
 use crate::command::{Command, CommandBus, CommandSender, CommandSource};
 use crate::event::EventLog;
-use crate::synth::ParamId;
+use crate::mcp::{start_socket_server, GridoxideMcp};
 use crate::ui::{
     get_param_value, render_grid, render_mixer, render_params, render_transport, GridState,
     MixerField, MixerState, ParamEditorState, Theme,
@@ -52,6 +53,8 @@ pub struct App {
     view: View,
     /// Whether the app should quit
     should_quit: bool,
+    /// Shutdown flag for the MCP socket server
+    mcp_shutdown: Arc<AtomicBool>,
 }
 
 impl App {
@@ -69,6 +72,15 @@ impl App {
         // Create event log
         let event_log = Arc::new(RwLock::new(EventLog::new()));
 
+        // Start MCP socket server (shares same command bus and state as TUI)
+        let mcp_shutdown = Arc::new(AtomicBool::new(false));
+        let mcp_handler = Arc::new(GridoxideMcp::new(
+            command_sender.clone(),
+            event_log.clone(),
+            sequencer_state.clone(),
+        ));
+        start_socket_server(mcp_handler, mcp_shutdown.clone());
+
         Ok(Self {
             theme,
             _audio: audio,
@@ -80,6 +92,7 @@ impl App {
             mixer_state: MixerState::new(),
             view: View::Grid,
             should_quit: false,
+            mcp_shutdown,
         })
     }
 
@@ -103,6 +116,9 @@ impl App {
         let mut terminal = Self::setup_terminal()?;
 
         let result = self.main_loop(&mut terminal);
+
+        // Signal socket server to shut down
+        self.mcp_shutdown.store(true, Ordering::Relaxed);
 
         Self::restore_terminal(&mut terminal)?;
 
@@ -238,6 +254,23 @@ impl App {
             // Fill current track
             KeyCode::Char('f') => {
                 self.dispatch(Command::FillTrack(self.grid_state.cursor_track));
+            }
+
+            // Note down 1 semitone
+            KeyCode::Char('[') => {
+                self.adjust_step_note(-1);
+            }
+            // Note up 1 semitone
+            KeyCode::Char(']') => {
+                self.adjust_step_note(1);
+            }
+            // Note down 1 octave (Shift+[)
+            KeyCode::Char('{') => {
+                self.adjust_step_note(-12);
+            }
+            // Note up 1 octave (Shift+])
+            KeyCode::Char('}') => {
+                self.adjust_step_note(12);
             }
 
             _ => {}
@@ -399,6 +432,27 @@ impl App {
         }
     }
 
+    /// Adjust the note of the current step in grid view (semitone delta)
+    fn adjust_step_note(&mut self, delta: i32) {
+        let track = self.grid_state.cursor_track;
+        let step = self.grid_state.cursor_step;
+        let state = self.sequencer_state.read();
+        let step_data = state.pattern.get_step(track, step);
+        drop(state);
+
+        // Only adjust note on active steps
+        if !step_data.active {
+            return;
+        }
+
+        let new_note = (step_data.note as i32 + delta).clamp(0, 127) as u8;
+        self.dispatch(Command::SetStepNote {
+            track,
+            step,
+            note: new_note,
+        });
+    }
+
     /// Adjust the currently selected parameter
     fn adjust_current_param(&mut self, delta_normalized: f32) {
         let Some(param) = self.param_editor.current_param() else {
@@ -441,6 +495,18 @@ impl App {
         let state = self.sequencer_state.read();
 
         self.render_header(frame, chunks[0]);
+        // Get cursor note info for transport display
+        let cursor_note = {
+            let step_data = state.pattern.get_step(
+                self.grid_state.cursor_track,
+                self.grid_state.cursor_step,
+            );
+            if self.view == View::Grid {
+                Some((step_data.active, step_data.note))
+            } else {
+                None
+            }
+        };
         render_transport(
             frame,
             chunks[1],
@@ -448,6 +514,7 @@ impl App {
             state.bpm,
             state.current_step,
             &self.theme,
+            cursor_note,
         );
 
         // Render main content based on view
@@ -507,7 +574,7 @@ impl App {
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let help = match self.view {
             View::Grid => format!(
-                "SPACE:Toggle | P:Play | S:Stop | +/-:BPM | C:Clear | F:Fill | TAB:Params | Q:Quit | {}",
+                "SPACE:Toggle | [/]:Note | P:Play | S:Stop | +/-:BPM | C:Clear | F:Fill | TAB:Params | Q:Quit | {}",
                 self.theme.name
             ),
             View::Params => format!(

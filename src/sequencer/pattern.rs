@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::synth::DEFAULT_NOTES;
+
 pub const STEPS: usize = 16;
 pub const TRACKS: usize = 4;
 
@@ -32,23 +34,52 @@ impl TrackType {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct StepData {
+    pub active: bool,
+    pub note: u8, // MIDI note 0-127
+}
+
+impl StepData {
+    pub fn off(note: u8) -> Self {
+        Self {
+            active: false,
+            note,
+        }
+    }
+
+    pub fn on(note: u8) -> Self {
+        Self {
+            active: true,
+            note,
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Pattern {
-    /// steps[track][step] = active
-    pub steps: [[bool; STEPS]; TRACKS],
+    /// steps[track][step]
+    pub steps: [[StepData; STEPS]; TRACKS],
 }
 
 impl Pattern {
     pub fn new() -> Self {
-        Self {
-            steps: [[false; STEPS]; TRACKS],
+        let mut steps = [[StepData::off(60); STEPS]; TRACKS];
+        // Initialize each track with its default note
+        for track in 0..TRACKS {
+            let default_note = DEFAULT_NOTES[track];
+            for step in 0..STEPS {
+                steps[track][step] = StepData::off(default_note);
+            }
         }
+        Self { steps }
     }
 
+    /// Toggle step active state. When activating, uses the step's existing note.
     pub fn toggle(&mut self, track: usize, step: usize) -> bool {
         if track < TRACKS && step < STEPS {
-            self.steps[track][step] = !self.steps[track][step];
-            self.steps[track][step]
+            self.steps[track][step].active = !self.steps[track][step].active;
+            self.steps[track][step].active
         } else {
             false
         }
@@ -56,32 +87,57 @@ impl Pattern {
 
     pub fn set(&mut self, track: usize, step: usize, value: bool) {
         if track < TRACKS && step < STEPS {
-            self.steps[track][step] = value;
+            self.steps[track][step].active = value;
         }
     }
 
+    /// Backward-compatible: returns whether a step is active
     pub fn get(&self, track: usize, step: usize) -> bool {
         if track < TRACKS && step < STEPS {
-            self.steps[track][step]
+            self.steps[track][step].active
         } else {
             false
         }
     }
 
+    /// Get full step data (active + note)
+    pub fn get_step(&self, track: usize, step: usize) -> StepData {
+        if track < TRACKS && step < STEPS {
+            self.steps[track][step]
+        } else {
+            StepData::off(60)
+        }
+    }
+
+    /// Set the MIDI note for a step
+    pub fn set_note(&mut self, track: usize, step: usize, note: u8) {
+        if track < TRACKS && step < STEPS {
+            self.steps[track][step].note = note.min(127);
+        }
+    }
+
     pub fn clear_track(&mut self, track: usize) {
         if track < TRACKS {
-            self.steps[track] = [false; STEPS];
+            let default_note = DEFAULT_NOTES[track];
+            for step in 0..STEPS {
+                self.steps[track][step] = StepData::off(default_note);
+            }
         }
     }
 
     pub fn fill_track(&mut self, track: usize) {
         if track < TRACKS {
-            self.steps[track] = [true; STEPS];
+            let default_note = DEFAULT_NOTES[track];
+            for step in 0..STEPS {
+                self.steps[track][step] = StepData::on(default_note);
+            }
         }
     }
 
     pub fn clear_all(&mut self) {
-        self.steps = [[false; STEPS]; TRACKS];
+        for track in 0..TRACKS {
+            self.clear_track(track);
+        }
     }
 }
 

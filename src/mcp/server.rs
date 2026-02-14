@@ -7,7 +7,7 @@ use crate::audio::SequencerState;
 use crate::command::{Command, CommandSender, CommandSource};
 use crate::event::EventLog;
 use crate::sequencer::TrackType;
-use crate::synth::{BassParams, HiHatParams, KickParams, ParamId, SnareParams};
+use crate::synth::{note_name, BassParams, HiHatParams, KickParams, ParamId, SnareParams, DEFAULT_NOTES};
 use crate::ui::get_param_value;
 
 /// MCP server handler for gridoxide
@@ -69,13 +69,19 @@ impl GridoxideMcp {
 
     // === Pattern Tools ===
 
-    /// Toggle a step on/off (track: 0-3, step: 0-15)
-    pub fn toggle_step(&self, track: usize, step: usize) -> Value {
+    /// Toggle a step on/off (track: 0-3, step: 0-15), optionally setting a note
+    pub fn toggle_step(&self, track: usize, step: usize, note: Option<u8>) -> Value {
         if track >= 4 {
             return json!({ "status": "error", "message": "Track must be 0-3" });
         }
         if step >= 16 {
             return json!({ "status": "error", "message": "Step must be 0-15" });
+        }
+
+        // If a note is provided, set it before toggling
+        if let Some(n) = note {
+            let clamped = n.min(127);
+            self.dispatch(Command::SetStepNote { track, step, note: clamped });
         }
 
         self.dispatch(Command::ToggleStep { track, step });
@@ -92,23 +98,88 @@ impl GridoxideMcp {
         })
     }
 
-    /// Get the full pattern grid
+    /// Get the full pattern grid (including note data)
     pub fn get_pattern(&self) -> Value {
         let state = self.sequencer_state.read();
         let tracks: Vec<Value> = (0..4)
             .map(|track| {
                 let track_type = TrackType::from_index(track).unwrap();
                 let steps: Vec<bool> = (0..16).map(|step| state.pattern.get(track, step)).collect();
+                let notes: Vec<Value> = (0..16)
+                    .map(|step| {
+                        let sd = state.pattern.get_step(track, step);
+                        json!({
+                            "note": sd.note,
+                            "note_name": note_name(sd.note)
+                        })
+                    })
+                    .collect();
                 json!({
                     "track": track,
                     "name": track_type.name(),
-                    "steps": steps
+                    "steps": steps,
+                    "notes": notes,
+                    "default_note": DEFAULT_NOTES[track]
                 })
             })
             .collect();
 
         json!({
             "tracks": tracks
+        })
+    }
+
+    /// Set the MIDI note for a specific step
+    pub fn set_step_note(&self, track: usize, step: usize, note: u8) -> Value {
+        if track >= 4 {
+            return json!({ "status": "error", "message": "Track must be 0-3" });
+        }
+        if step >= 16 {
+            return json!({ "status": "error", "message": "Step must be 0-15" });
+        }
+        let clamped = note.min(127);
+
+        self.dispatch(Command::SetStepNote { track, step, note: clamped });
+
+        let track_name = TrackType::from_index(track)
+            .map(|t| t.name())
+            .unwrap_or("unknown");
+
+        json!({
+            "status": "ok",
+            "track": track,
+            "track_name": track_name,
+            "step": step,
+            "note": clamped,
+            "note_name": note_name(clamped)
+        })
+    }
+
+    /// Get all step data for a track including notes
+    pub fn get_step_notes(&self, track: usize) -> Value {
+        if track >= 4 {
+            return json!({ "status": "error", "message": "Track must be 0-3" });
+        }
+
+        let state = self.sequencer_state.read();
+        let track_type = TrackType::from_index(track).unwrap();
+        let steps: Vec<Value> = (0..16)
+            .map(|step| {
+                let sd = state.pattern.get_step(track, step);
+                json!({
+                    "step": step,
+                    "active": sd.active,
+                    "note": sd.note,
+                    "note_name": note_name(sd.note)
+                })
+            })
+            .collect();
+
+        json!({
+            "track": track,
+            "name": track_type.name(),
+            "default_note": DEFAULT_NOTES[track],
+            "steps": steps
         })
     }
 
@@ -381,9 +452,20 @@ impl GridoxideMcp {
             "toggle_step" => {
                 let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let step = args.get("step").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                self.toggle_step(track, step)
+                let note = args.get("note").and_then(|v| v.as_u64()).map(|n| n as u8);
+                self.toggle_step(track, step, note)
             }
             "get_pattern" => self.get_pattern(),
+            "set_step_note" => {
+                let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let step = args.get("step").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let note = args.get("note").and_then(|v| v.as_u64()).unwrap_or(60) as u8;
+                self.set_step_note(track, step, note)
+            }
+            "get_step_notes" => {
+                let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                self.get_step_notes(track)
+            }
             "clear_track" => {
                 let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 self.clear_track(track)
@@ -498,6 +580,10 @@ impl GridoxideMcp {
                             "step": {
                                 "type": "integer",
                                 "description": "Step index (0-15)"
+                            },
+                            "note": {
+                                "type": "integer",
+                                "description": "Optional MIDI note (0-127) to set before toggling. If omitted, uses the step's existing note."
                             }
                         },
                         "required": ["track", "step"]
@@ -509,6 +595,42 @@ impl GridoxideMcp {
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
+                    }
+                },
+                {
+                    "name": "set_step_note",
+                    "description": "Set the MIDI note for a step. Each step can have its own pitch (0-127). Affects how the synth sounds when that step triggers.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "track": {
+                                "type": "integer",
+                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
+                            },
+                            "step": {
+                                "type": "integer",
+                                "description": "Step index (0-15)"
+                            },
+                            "note": {
+                                "type": "integer",
+                                "description": "MIDI note number (0-127). 60=C4, 69=A4(440Hz). Bass: sets frequency. Kick: scales pitch. Snare: scales tone. HiHat: scales brightness."
+                            }
+                        },
+                        "required": ["track", "step", "note"]
+                    }
+                },
+                {
+                    "name": "get_step_notes",
+                    "description": "Get all step data for a track including notes. Shows active state and MIDI note for each of the 16 steps.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "track": {
+                                "type": "integer",
+                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
+                            }
+                        },
+                        "required": ["track"]
                     }
                 },
                 {

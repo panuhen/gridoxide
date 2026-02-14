@@ -1,4 +1,4 @@
-use super::params::BassParams;
+use super::params::{midi_to_freq, BassParams};
 
 /// Bass synthesizer
 /// Simple sine/saw at low frequency with sustain
@@ -9,11 +9,14 @@ pub struct BassSynth {
     osc_phase: f32,
     sub_phase: f32,
     params: BassParams,
+    /// Active frequency set by trigger_with_note (overrides params.frequency)
+    active_frequency: f32,
 }
 
 impl BassSynth {
     pub fn new(sample_rate: f32) -> Self {
         let params = BassParams::default();
+        let active_frequency = params.frequency;
         Self {
             phase: None,
             sample_rate,
@@ -21,11 +24,13 @@ impl BassSynth {
             osc_phase: 0.0,
             sub_phase: 0.0,
             params,
+            active_frequency,
         }
     }
 
     /// Update parameters
     pub fn set_params(&mut self, params: BassParams) {
+        self.active_frequency = params.frequency;
         self.params = params;
     }
 
@@ -38,6 +43,14 @@ impl BassSynth {
         self.phase = Some(0);
         self.osc_phase = 0.0;
         self.sub_phase = 0.0;
+        self.active_frequency = self.params.frequency;
+    }
+
+    pub fn trigger_with_note(&mut self, note: u8) {
+        self.phase = Some(0);
+        self.osc_phase = 0.0;
+        self.sub_phase = 0.0;
+        self.active_frequency = midi_to_freq(note);
     }
 
     pub fn next_sample(&mut self) -> f32 {
@@ -53,13 +66,13 @@ impl BassSynth {
         let t = phase as f32 / self.sample_rate;
 
         // Main oscillator phase
-        self.osc_phase += self.params.frequency / self.sample_rate;
+        self.osc_phase += self.active_frequency / self.sample_rate;
         if self.osc_phase >= 1.0 {
             self.osc_phase -= 1.0;
         }
 
         // Sub oscillator phase (one octave down)
-        self.sub_phase += (self.params.frequency * 0.5) / self.sample_rate;
+        self.sub_phase += (self.active_frequency * 0.5) / self.sample_rate;
         if self.sub_phase >= 1.0 {
             self.sub_phase -= 1.0;
         }

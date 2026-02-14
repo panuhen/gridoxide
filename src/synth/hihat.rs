@@ -1,4 +1,4 @@
-use super::params::HiHatParams;
+use super::params::{midi_to_freq, HiHatParams, DEFAULT_NOTES};
 
 /// Hi-hat synthesizer
 /// High-passed noise with very short envelope
@@ -9,6 +9,8 @@ pub struct HiHatSynth {
     noise_state: u32,
     filter_state: f32,
     params: HiHatParams,
+    /// Brightness ratio from note (1.0 = default)
+    brightness_ratio: f32,
 }
 
 impl HiHatSynth {
@@ -21,6 +23,7 @@ impl HiHatSynth {
             noise_state: 67890,
             filter_state: 0.0,
             params,
+            brightness_ratio: 1.0,
         }
     }
 
@@ -41,6 +44,18 @@ impl HiHatSynth {
     pub fn trigger(&mut self) {
         self.phase = Some(0);
         self.filter_state = 0.0;
+        self.brightness_ratio = 1.0;
+        // Recalculate duration on trigger based on open parameter
+        let base_duration = if self.params.open > 0.5 { 0.2 } else { 0.05 };
+        let open_factor = 1.0 + self.params.open * 3.0;
+        self.duration_samples = (self.sample_rate * base_duration * open_factor) as usize;
+    }
+
+    /// Trigger with a specific MIDI note (scales brightness)
+    pub fn trigger_with_note(&mut self, note: u8) {
+        self.phase = Some(0);
+        self.filter_state = 0.0;
+        self.brightness_ratio = midi_to_freq(note) / midi_to_freq(DEFAULT_NOTES[2]);
         // Recalculate duration on trigger based on open parameter
         let base_duration = if self.params.open > 0.5 { 0.2 } else { 0.05 };
         let open_factor = 1.0 + self.params.open * 3.0;
@@ -70,7 +85,9 @@ impl HiHatSynth {
 
         // High-pass filter (adjustable with tone parameter)
         // Higher tone = more high frequencies (brighter)
-        let alpha = 0.9 + self.params.tone * 0.09; // 0.9 to 0.99
+        // Scale alpha by brightness_ratio: higher notes = brighter
+        let base_alpha = 0.9 + self.params.tone * 0.09; // 0.9 to 0.99
+        let alpha = (base_alpha * self.brightness_ratio).clamp(0.5, 0.999);
         let filtered = noise - self.filter_state + alpha * self.filter_state;
         self.filter_state = noise;
 

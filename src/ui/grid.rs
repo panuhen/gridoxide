@@ -2,6 +2,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders};
 
 use crate::sequencer::{Pattern, TrackType, STEPS, TRACKS};
+use crate::synth::note_name;
 use crate::ui::Theme;
 
 /// Grid cursor and playhead state
@@ -27,6 +28,26 @@ impl GridState {
 impl Default for GridState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Format a note name to fit in cell_width characters
+fn format_note(note: u8, cell_width: u16) -> String {
+    let name = note_name(note);
+    if cell_width >= 3 {
+        // Pad or truncate to 3 chars: "C4 " or "C#3"
+        if name.len() <= cell_width as usize {
+            format!("{:<width$}", name, width = cell_width as usize)
+        } else {
+            name[..cell_width as usize].to_string()
+        }
+    } else {
+        // 2-char mode: "C4" for naturals, "C#" for sharps (drop octave)
+        if name.contains('#') {
+            name[..2].to_string()
+        } else {
+            name[..2.min(name.len())].to_string()
+        }
     }
 }
 
@@ -90,15 +111,24 @@ pub fn render_grid(
                 break;
             }
 
-            let is_active = pattern.get(track, step);
+            let step_data = pattern.get_step(track, step);
+            let is_active = step_data.active;
             let is_cursor = track == grid_state.cursor_track && step == grid_state.cursor_step;
             let is_playhead = playing && step == current_step;
 
+            // Get note display for active steps
+            let note_display = if is_active {
+                format_note(step_data.note, cell_width)
+            } else {
+                String::new()
+            };
+
             // Determine cell style
+            let display_width = cell_width.min(3);
             let (symbol, style) = if is_cursor {
                 if is_active {
                     (
-                        "[]",
+                        format!("{:<width$}", note_display, width = display_width as usize),
                         Style::default()
                             .fg(theme.bg)
                             .bg(theme.grid_cursor)
@@ -106,14 +136,14 @@ pub fn render_grid(
                     )
                 } else {
                     (
-                        "[]",
+                        format!("{:<width$}", "[]", width = display_width as usize),
                         Style::default().fg(theme.grid_cursor).bg(theme.bg).bold(),
                     )
                 }
             } else if is_playhead {
                 if is_active {
                     (
-                        "##",
+                        format!("{:<width$}", note_display, width = display_width as usize),
                         Style::default()
                             .fg(theme.bg)
                             .bg(theme.highlight)
@@ -121,25 +151,25 @@ pub fn render_grid(
                     )
                 } else {
                     (
-                        "::",
+                        format!("{:<width$}", "::", width = display_width as usize),
                         Style::default().fg(theme.highlight).bg(theme.bg),
                     )
                 }
             } else if is_active {
                 (
-                    "##",
+                    format!("{:<width$}", note_display, width = display_width as usize),
                     Style::default().fg(theme.grid_active).bg(theme.bg),
                 )
             } else {
                 // Beat markers (every 4 steps)
                 if step % 4 == 0 {
                     (
-                        ". ",
+                        format!("{:<width$}", ". ", width = display_width as usize),
                         Style::default().fg(theme.dimmed).bg(theme.bg),
                     )
                 } else {
                     (
-                        "- ",
+                        format!("{:<width$}", "- ", width = display_width as usize),
                         Style::default().fg(theme.grid_inactive).bg(theme.bg),
                     )
                 }
@@ -147,7 +177,7 @@ pub fn render_grid(
 
             frame.render_widget(
                 ratatui::widgets::Paragraph::new(symbol).style(style),
-                Rect::new(step_x, track_y, cell_width.min(2), 1),
+                Rect::new(step_x, track_y, display_width, 1),
             );
         }
     }
@@ -161,6 +191,7 @@ pub fn render_transport(
     bpm: f32,
     current_step: usize,
     theme: &Theme,
+    cursor_note: Option<(bool, u8)>,
 ) {
     let status = if playing { "PLAY" } else { "STOP" };
     let status_style = if playing {
@@ -169,7 +200,7 @@ pub fn render_transport(
         Style::default().fg(theme.dimmed)
     };
 
-    let transport_text = vec![
+    let mut transport_text = vec![
         Span::styled(format!(" {} ", status), status_style),
         Span::styled(" | ", Style::default().fg(theme.border)),
         Span::styled(
@@ -182,6 +213,17 @@ pub fn render_transport(
             Style::default().fg(theme.fg),
         ),
     ];
+
+    // Show note info when cursor is on an active step
+    if let Some((active, note)) = cursor_note {
+        if active {
+            transport_text.push(Span::styled(" | ", Style::default().fg(theme.border)));
+            transport_text.push(Span::styled(
+                format!("Note: {}", note_name(note)),
+                Style::default().fg(theme.highlight),
+            ));
+        }
+    }
 
     let transport = ratatui::widgets::Paragraph::new(Line::from(transport_text))
         .style(Style::default().bg(theme.bg))

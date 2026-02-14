@@ -1,5 +1,26 @@
 use serde::{Deserialize, Serialize};
 
+/// Convert MIDI note number to frequency in Hz
+/// A4 (69) = 440 Hz
+pub fn midi_to_freq(note: u8) -> f32 {
+    440.0 * 2.0f32.powf((note as f32 - 69.0) / 12.0)
+}
+
+/// Note name from MIDI note number (e.g., 60 -> "C4", 61 -> "C#4")
+pub fn note_name(note: u8) -> String {
+    let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    let octave = (note / 12) as i32 - 1;
+    format!("{}{}", names[note as usize % 12], octave)
+}
+
+/// Default MIDI notes per track (produce same sound as current defaults)
+pub const DEFAULT_NOTES: [u8; 4] = [
+    36, // Kick: C2
+    50, // Snare: D3
+    60, // HiHat: C4
+    33, // Bass: A1 (55 Hz)
+];
+
 /// Kick drum parameters
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KickParams {

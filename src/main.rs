@@ -18,7 +18,7 @@ use app::App;
 use audio::AudioEngine;
 use command::CommandBus;
 use event::EventLog;
-use mcp::GridoxideMcp;
+use mcp::{run_as_proxy, GridoxideMcp};
 use ui::Theme;
 
 /// Gridoxide - Terminal EDM Production Studio
@@ -52,6 +52,11 @@ fn main() -> Result<()> {
 
     // MCP server mode
     if args.mcp {
+        // Try connecting to the TUI's socket first (shared state)
+        if run_as_proxy().is_ok() {
+            return Ok(());
+        }
+        // Fall back to standalone MCP server (own audio engine)
         return run_mcp_server();
     }
 
@@ -69,7 +74,7 @@ fn main() -> Result<()> {
     app.run()
 }
 
-/// Run gridoxide as an MCP server (headless, JSON-RPC over stdio)
+/// Run gridoxide as a standalone MCP server (headless, JSON-RPC over stdio)
 fn run_mcp_server() -> Result<()> {
     // Create command bus
     let command_bus = CommandBus::new();

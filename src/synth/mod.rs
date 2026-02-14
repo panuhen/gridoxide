@@ -7,5 +7,5 @@ pub mod snare;
 pub use bass::BassSynth;
 pub use hihat::HiHatSynth;
 pub use kick::KickSynth;
-pub use params::{BassParams, HiHatParams, KickParams, ParamId, SnareParams};
+pub use params::{midi_to_freq, note_name, BassParams, HiHatParams, KickParams, ParamId, SnareParams, DEFAULT_NOTES};
 pub use snare::SnareSynth;
