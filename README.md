@@ -6,15 +6,17 @@ A Rust-based terminal step sequencer and synthesizer for EDM production.
 
 Gridoxide is a terminal EDM production studio designed for collaborative use between humans (via TUI) and Claude (via MCP tools). The core principle is **full parity between TUI and MCP** - every state-mutating action flows through the same command bus regardless of source.
 
-## Current Status: Phase 2
+## Current Status: Phase 3
 
-Phase 2 implements the grid sequencer:
+Phase 3 implements sound shaping with real-time synth parameter control:
 - 4 tracks: Kick, Snare, Hi-hat, Bass
-- 16-step pattern grid
+- 16-step pattern grid with Grid view
+- Parameter editor with Params view (Tab to switch)
+- Real-time synth parameter tweaking
 - BPM clock with play/stop
 - Command bus architecture
 - Event logging for MCP "listening"
-- MCP server with transport and pattern tools
+- MCP server with transport, pattern, and track parameter tools
 
 ## Installation
 
@@ -44,6 +46,7 @@ gridoxide --mcp
 
 ## Controls
 
+### Grid View
 | Key | Action |
 |-----|--------|
 | Arrow keys / hjkl | Navigate grid |
@@ -53,7 +56,20 @@ gridoxide --mcp
 | +/- | Adjust BPM |
 | C | Clear current track |
 | F | Fill current track |
+| Tab / E | Switch to Params view |
 | Q / Esc | Quit |
+
+### Params View
+| Key | Action |
+|-----|--------|
+| 1-4 | Select track |
+| Up/Down / jk | Select parameter |
+| Left/Right / hl | Adjust value (fine ±5%) |
+| [ / ] | Adjust value (coarse ±20%) |
+| P | Play/Stop toggle |
+| S | Stop |
+| Tab / Esc | Switch to Grid view |
+| Q | Quit |
 
 ## MCP Tools
 
@@ -70,6 +86,12 @@ When running with `--mcp`, gridoxide exposes these tools:
 - `get_pattern` - Get full grid
 - `clear_track` - Clear a track
 - `fill_track` - Fill a track
+
+**Track Parameters:**
+- `list_tracks` - List all tracks with available parameters
+- `get_track_params` - Get params for a track with values and ranges
+- `set_param` - Set a parameter (e.g., `kick_pitch_start`, `snare_snappy`)
+- `reset_track` - Reset track to default parameters
 
 **Events:**
 - `get_events` - Get recent events (for "listening" to human actions)
@@ -97,8 +119,8 @@ MCP (tools)  ───┘         │
 | Phase | Name | Status |
 |-------|------|--------|
 | 1 | Sound comes out | Complete |
-| 2 | Grid sequencer | **Complete** |
-| 3 | Sound shaping | Planned |
+| 2 | Grid sequencer | Complete |
+| 3 | Sound shaping | **Complete** |
 | 4 | Mixing | Planned |
 | 5 | Effects | Planned |
 | 6 | Patterns + Arrangement | Planned |
