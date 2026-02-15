@@ -1,6 +1,6 @@
 [package]
 name = "gridoxide"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Terminal EDM Production Studio - A Rust-based step sequencer and synthesizer"
 license = "MIT"
@@ -13,6 +13,7 @@ crossterm = "0.28"
 # Audio
 cpal = "0.15"
 fundsp = "0.18"
+hound = "3.5"
 
 # Serialization (for project files and MCP)
 serde = { version = "1", features = ["derive"] }

@@ -43,9 +43,9 @@ Core principle: **full parity between TUI and MCP** via unified command bus. Eve
 | 4 | Mixing | Volume, pan, mute/solo, mixer view, MCP mixer | **COMPLETE** |
 | 4.5 | Per-step notes | Per-step pitch/note data, melodic sequencing, MCP note tools, TUI+MCP socket bridge | **COMPLETE** |
 | 5 | Effects | FX chains, filter/delay/reverb/distortion, MCP fx | **COMPLETE** |
-| 6 | Patterns + Arrangement | Multiple patterns, chaining, arrangement view | Planned |
-| 7 | Project I/O | Save/load JSON, export WAV | Planned |
-| 8 | MIDI | Controller input, CC mapping, MIDI learn | Planned |
+| 6 | Patterns + Arrangement | Multiple patterns, chaining, arrangement view | **COMPLETE** |
+| 7 | Project I/O | Save/load JSON, export WAV | **COMPLETE** |
+| 8 | Sample Engine | Load .wav samples per track, pitch shifting, start/end points | Planned |
 | 9 | Polish | Velocity/probability, undo/redo, more engines | Planned |
 
 ---

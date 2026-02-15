@@ -157,7 +157,7 @@ impl MasterFxParamId {
 }
 
 /// Per-track FX state (shared between audio thread and UI/MCP)
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrackFxState {
     pub filter_enabled: bool,
     pub filter_type: FilterType,
@@ -191,7 +191,7 @@ impl Default for TrackFxState {
 }
 
 /// Master FX state (shared between audio thread and UI/MCP)
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MasterFxState {
     pub reverb_enabled: bool,
     pub reverb_decay: f32,
@@ -246,4 +246,20 @@ impl TrackFxChain {
         }
         s
     }
+}
+
+/// Configure a TrackFxChain from a TrackFxState snapshot.
+/// Used by both the LoadProject handler and the offline renderer.
+pub fn configure_fx_chain(chain: &mut TrackFxChain, state: &TrackFxState) {
+    chain.filter_enabled = state.filter_enabled;
+    chain.filter.set_filter_type(state.filter_type);
+    chain.filter.set_cutoff(state.filter_cutoff);
+    chain.filter.set_resonance(state.filter_resonance);
+    chain.dist_enabled = state.dist_enabled;
+    chain.distortion.set_drive(state.dist_drive);
+    chain.distortion.set_mix(state.dist_mix);
+    chain.delay_enabled = state.delay_enabled;
+    chain.delay.set_time(state.delay_time);
+    chain.delay.set_feedback(state.delay_feedback);
+    chain.delay.set_mix(state.delay_mix);
 }

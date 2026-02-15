@@ -84,7 +84,7 @@ impl Default for Arrangement {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PatternBank {
     pub patterns: Vec<Pattern>, // always NUM_PATTERNS length
 }
@@ -177,7 +177,7 @@ impl StepData {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pattern {
     /// steps[track][step]
     pub steps: [[StepData; STEPS]; TRACKS],

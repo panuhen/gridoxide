@@ -7,7 +7,8 @@ use parking_lot::RwLock;
 
 use crate::command::{Command, CommandReceiver};
 use crate::fx::{
-    FxParamId, FxType, MasterFxParamId, MasterFxState, StereoReverb, TrackFxChain, TrackFxState,
+    configure_fx_chain, FxParamId, FxType, MasterFxParamId, MasterFxState, StereoReverb,
+    TrackFxChain, TrackFxState,
 };
 use crate::sequencer::{
     Arrangement, Clock, Pattern, PatternBank, PlaybackMode, NUM_PATTERNS,
@@ -18,7 +19,7 @@ use crate::synth::{
 };
 
 /// Shared state between audio thread and UI/MCP
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SequencerState {
     pub playing: bool,
     pub bpm: f32,
@@ -493,6 +494,54 @@ impl AudioEngine {
                             local_arrangement_repeat = 0;
                             if let Some(mut state) = state.try_write() {
                                 state.arrangement = local_arrangement.clone();
+                                state.arrangement_position = 0;
+                                state.arrangement_repeat = 0;
+                            }
+                        }
+
+                        Command::LoadProject(new_state) => {
+                            // Stop playback
+                            clock.stop();
+                            clock.set_bpm(new_state.bpm);
+                            pending_pattern_switch = None;
+
+                            // Restore synth params
+                            kick.set_params(new_state.kick_params.clone());
+                            snare.set_params(new_state.snare_params.clone());
+                            hihat.set_params(new_state.hihat_params.clone());
+                            bass.set_params(new_state.bass_params.clone());
+
+                            // Restore mixer
+                            local_volumes = new_state.track_volumes;
+                            local_pans = new_state.track_pans;
+                            local_mutes = new_state.track_mutes;
+                            local_solos = new_state.track_solos;
+
+                            // Restore FX
+                            for i in 0..4 {
+                                configure_fx_chain(&mut fx_chains[i], &new_state.track_fx[i]);
+                                local_track_fx[i] = new_state.track_fx[i].clone();
+                            }
+                            reverb.set_decay(new_state.master_fx.reverb_decay);
+                            reverb.set_mix(new_state.master_fx.reverb_mix);
+                            reverb.set_damping(new_state.master_fx.reverb_damping);
+                            reverb_enabled = new_state.master_fx.reverb_enabled;
+                            local_master_fx = new_state.master_fx.clone();
+
+                            // Restore pattern bank + arrangement
+                            local_pattern_bank = new_state.pattern_bank.clone();
+                            local_current_pattern = new_state.current_pattern;
+                            pattern = local_pattern_bank.get(local_current_pattern).clone();
+                            local_playback_mode = new_state.playback_mode;
+                            local_arrangement = new_state.arrangement.clone();
+                            local_arrangement_position = 0;
+                            local_arrangement_repeat = 0;
+
+                            // Sync shared state
+                            if let Some(mut state) = state.try_write() {
+                                *state = *new_state;
+                                state.playing = false;
+                                state.current_step = 0;
                                 state.arrangement_position = 0;
                                 state.arrangement_repeat = 0;
                             }

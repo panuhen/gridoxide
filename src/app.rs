@@ -1,10 +1,11 @@
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -19,6 +20,8 @@ use crate::command::{Command, CommandBus, CommandSender, CommandSource};
 use crate::event::EventLog;
 use crate::fx::{FilterType, FxParamId, FxType, MasterFxParamId};
 use crate::mcp::{start_socket_server, GridoxideMcp};
+use crate::project;
+use crate::project::renderer::{ExportMode, export_wav};
 use crate::sequencer::{PlaybackMode, NUM_PATTERNS};
 use crate::ui::{
     get_param_value, render_fx, render_grid, render_mixer, render_params, render_song,
@@ -64,6 +67,10 @@ pub struct App {
     should_quit: bool,
     /// Shutdown flag for the MCP socket server
     mcp_shutdown: Arc<AtomicBool>,
+    /// Last project file path (for repeat save/load)
+    project_path: Option<PathBuf>,
+    /// Temporary status message (e.g., "Saved: project.grox")
+    status_message: Option<(String, Instant)>,
 }
 
 impl App {
@@ -104,6 +111,8 @@ impl App {
             view: View::Grid,
             should_quit: false,
             mcp_shutdown,
+            project_path: None,
+            status_message: None,
         })
     }
 
@@ -164,7 +173,7 @@ impl App {
                 if let Event::Key(key) = event::read()? {
                     // Only handle key press events (not release)
                     if key.kind == KeyEventKind::Press {
-                        self.handle_key(key.code);
+                        self.handle_key(key);
                     }
                 }
             }
@@ -185,14 +194,107 @@ impl App {
         self.command_sender.send(cmd, CommandSource::Tui);
     }
 
+    /// Set a temporary status message shown in the footer
+    fn set_status(&mut self, msg: String) {
+        self.status_message = Some((msg, Instant::now()));
+    }
+
     /// Handle key press events
-    fn handle_key(&mut self, key: KeyCode) {
+    fn handle_key(&mut self, key: KeyEvent) {
+        // Global Ctrl keybindings (checked before view-specific)
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('s') => {
+                    self.save_project_action();
+                    return;
+                }
+                KeyCode::Char('o') => {
+                    self.load_project_action();
+                    return;
+                }
+                KeyCode::Char('e') => {
+                    self.export_pattern_action();
+                    return;
+                }
+                KeyCode::Char('w') => {
+                    self.export_song_action();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match self.view {
-            View::Grid => self.handle_grid_key(key),
-            View::Params => self.handle_params_key(key),
-            View::Mixer => self.handle_mixer_key(key),
-            View::Fx => self.handle_fx_key(key),
-            View::Song => self.handle_song_key(key),
+            View::Grid => self.handle_grid_key(key.code),
+            View::Params => self.handle_params_key(key.code),
+            View::Mixer => self.handle_mixer_key(key.code),
+            View::Fx => self.handle_fx_key(key.code),
+            View::Song => self.handle_song_key(key.code),
+        }
+    }
+
+    fn save_project_action(&mut self) {
+        let path = self
+            .project_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("project.grox"));
+        let state = self.sequencer_state.read().clone();
+        match project::save_project(&state, &path) {
+            Ok(()) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                self.set_status(format!("Saved: {}", name));
+                self.project_path = Some(path);
+            }
+            Err(e) => {
+                self.set_status(format!("Save failed: {}", e));
+            }
+        }
+    }
+
+    fn load_project_action(&mut self) {
+        let path = self
+            .project_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("project.grox"));
+        match project::load_project(&path) {
+            Ok(project_data) => {
+                let new_state = project_data.to_state();
+                self.dispatch(Command::LoadProject(Box::new(new_state)));
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                self.set_status(format!("Loaded: {}", name));
+                self.project_path = Some(path);
+            }
+            Err(e) => {
+                self.set_status(format!("Load failed: {}", e));
+            }
+        }
+    }
+
+    fn export_pattern_action(&mut self) {
+        let state = self.sequencer_state.read().clone();
+        let pat_idx = state.current_pattern;
+        let filename = format!("pattern_{:02}.wav", pat_idx);
+        let path = PathBuf::from(&filename);
+        match export_wav(&state, ExportMode::Pattern(pat_idx), &path) {
+            Ok(result) => {
+                self.set_status(format!("Exported: {} ({:.1}s)", filename, result.duration_secs));
+            }
+            Err(e) => {
+                self.set_status(format!("Export failed: {}", e));
+            }
+        }
+    }
+
+    fn export_song_action(&mut self) {
+        let state = self.sequencer_state.read().clone();
+        let path = PathBuf::from("song.wav");
+        match export_wav(&state, ExportMode::Song, &path) {
+            Ok(result) => {
+                self.set_status(format!("Exported: song.wav ({:.1}s)", result.duration_secs));
+            }
+            Err(e) => {
+                self.set_status(format!("Export failed: {}", e));
+            }
         }
     }
 
@@ -559,6 +661,36 @@ impl App {
                             repeats: entry.repeats + 1,
                         });
                     }
+                }
+            }
+
+            // Cycle pattern index on selected entry
+            KeyCode::Char('-') => {
+                let state = self.sequencer_state.read();
+                let pos = self.song_state.cursor_position;
+                if pos < state.arrangement.len() {
+                    let entry = state.arrangement.entries[pos];
+                    drop(state);
+                    let new_pat = if entry.pattern == 0 { NUM_PATTERNS - 1 } else { entry.pattern - 1 };
+                    self.dispatch(Command::SetArrangementEntry {
+                        position: pos,
+                        pattern: new_pat,
+                        repeats: entry.repeats,
+                    });
+                }
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                let state = self.sequencer_state.read();
+                let pos = self.song_state.cursor_position;
+                if pos < state.arrangement.len() {
+                    let entry = state.arrangement.entries[pos];
+                    drop(state);
+                    let new_pat = (entry.pattern + 1) % NUM_PATTERNS;
+                    self.dispatch(Command::SetArrangementEntry {
+                        position: pos,
+                        pattern: new_pat,
+                        repeats: entry.repeats,
+                    });
                 }
             }
 
@@ -929,32 +1061,20 @@ impl App {
         frame.render_widget(header, area);
     }
 
-    /// Render the footer with help
+    /// Render the footer with help or status message
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let help = match self.view {
-            View::Grid => format!(
-                "SPACE:Toggle | [/]:Note | ,/.:Pattern | P:Play | S:Stop | +/-:BPM | C:Clear | F:Fill | TAB:Params | Q:Quit | {}",
-                self.theme.name
-            ),
-            View::Params => format!(
-                "1-4:Track | Up/Down:Select | Left/Right:Adjust | [/]:Coarse | TAB:Mixer | Q:Quit | {}",
-                self.theme.name
-            ),
-            View::Mixer => format!(
-                "1-4:Track | Up/Down:Field | Left/Right:Adjust | M:Mute | O:Solo | TAB:FX | Q:Quit | {}",
-                self.theme.name
-            ),
-            View::Fx => format!(
-                "1-5:Track/Master | Up/Down:Select | Left/Right:Adjust | SPACE:Toggle FX | TAB:Song | Q:Quit | {}",
-                self.theme.name
-            ),
-            View::Song => format!(
-                "Up/Down:Move | Left/Right:Repeats | A:Add | D:Delete | Enter:Set Pat | ,/.:Pattern | M:Mode | P:Play | TAB:Grid | Q:Quit | {}",
-                self.theme.name
-            ),
+        // Show status message if recent (within 3 seconds)
+        let text = if let Some((ref msg, instant)) = self.status_message {
+            if instant.elapsed().as_secs() < 3 {
+                msg.clone()
+            } else {
+                self.footer_help()
+            }
+        } else {
+            self.footer_help()
         };
 
-        let footer = Paragraph::new(help)
+        let footer = Paragraph::new(text)
             .style(Style::default().fg(self.theme.dimmed).bg(self.theme.bg))
             .alignment(Alignment::Center)
             .block(
@@ -964,5 +1084,30 @@ impl App {
                     .style(Style::default().bg(self.theme.bg)),
             );
         frame.render_widget(footer, area);
+    }
+
+    fn footer_help(&self) -> String {
+        match self.view {
+            View::Grid => format!(
+                "SPACE:Toggle | [/]:Note | ,/.:Pattern | P:Play | S:Stop | C-s:Save | C-o:Load | C-e:Export | TAB:Params | Q:Quit | {}",
+                self.theme.name
+            ),
+            View::Params => format!(
+                "1-4:Track | Up/Down:Select | Left/Right:Adjust | [/]:Coarse | C-s:Save | TAB:Mixer | Q:Quit | {}",
+                self.theme.name
+            ),
+            View::Mixer => format!(
+                "1-4:Track | Up/Down:Field | Left/Right:Adjust | M:Mute | O:Solo | C-s:Save | TAB:FX | Q:Quit | {}",
+                self.theme.name
+            ),
+            View::Fx => format!(
+                "1-5:Track/Master | Up/Down:Select | Left/Right:Adjust | SPACE:Toggle FX | C-s:Save | TAB:Song | Q:Quit | {}",
+                self.theme.name
+            ),
+            View::Song => format!(
+                "Up/Down:Move | Left/Right:Repeats | +/-:Pattern | A:Add | D:Delete | M:Mode | P:Play | C-s:Save | C-w:Export Song | TAB:Grid | Q:Quit | {}",
+                self.theme.name
+            ),
+        }
     }
 }

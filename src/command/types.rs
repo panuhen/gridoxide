@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::audio::SequencerState;
 use crate::fx::{FilterType, FxParamId, FxType, MasterFxParamId};
 use crate::sequencer::PlaybackMode;
 use crate::synth::{BassParams, HiHatParams, KickParams, ParamId, SnareParams};
@@ -64,13 +65,16 @@ pub enum Command {
     RemoveArrangement(usize),
     SetArrangementEntry { position: usize, pattern: usize, repeats: usize },
     ClearArrangement,
+
+    // Project I/O
+    #[serde(skip)]
+    LoadProject(Box<SequencerState>),
 }
 
 impl Command {
     /// Returns true if this command should be logged to event log
     pub fn is_loggable(&self) -> bool {
-        // All commands are currently loggable
-        true
+        !matches!(self, Command::LoadProject(_))
     }
 
     /// Human-readable description of the command
@@ -155,6 +159,7 @@ impl Command {
                 )
             }
             Command::ClearArrangement => "Clear arrangement".to_string(),
+            Command::LoadProject(_) => "Load project".to_string(),
         }
     }
 }

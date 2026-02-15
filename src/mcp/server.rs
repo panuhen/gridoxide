@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -7,6 +8,8 @@ use crate::audio::SequencerState;
 use crate::command::{Command, CommandSender, CommandSource};
 use crate::event::EventLog;
 use crate::fx::{FilterType, FxParamId, FxType, MasterFxParamId};
+use crate::project;
+use crate::project::renderer::{ExportMode, export_wav};
 use crate::sequencer::{PlaybackMode, TrackType, NUM_PATTERNS};
 use crate::synth::{note_name, BassParams, HiHatParams, KickParams, ParamId, SnareParams, DEFAULT_NOTES};
 use crate::ui::get_param_value;
@@ -835,6 +838,123 @@ impl GridoxideMcp {
         })
     }
 
+    // === Project I/O Tools ===
+
+    /// Save project to a .grox JSON file
+    pub fn save_project(&self, path_str: &str) -> Value {
+        let path = Path::new(path_str);
+        let state = self.sequencer_state.read();
+        match project::save_project(&state, path) {
+            Ok(()) => json!({
+                "status": "ok",
+                "path": path_str,
+                "message": format!("Saved project to {}", path_str)
+            }),
+            Err(e) => json!({
+                "status": "error",
+                "message": format!("Failed to save: {}", e)
+            }),
+        }
+    }
+
+    /// Load project from a .grox JSON file
+    pub fn load_project(&self, path_str: &str) -> Value {
+        let path = Path::new(path_str);
+        match project::load_project(path) {
+            Ok(project_data) => {
+                let new_state = project_data.to_state();
+                self.dispatch(Command::LoadProject(Box::new(new_state)));
+                json!({
+                    "status": "ok",
+                    "path": path_str,
+                    "message": format!("Loaded project from {}", path_str)
+                })
+            }
+            Err(e) => json!({
+                "status": "error",
+                "message": format!("Failed to load: {}", e)
+            }),
+        }
+    }
+
+    /// Export audio as WAV file
+    pub fn export_wav_file(&self, path_str: &str, mode: &str, pattern: Option<usize>) -> Value {
+        let path = Path::new(path_str);
+        let state = self.sequencer_state.read();
+
+        let export_mode = match mode {
+            "pattern" => {
+                let idx = pattern.unwrap_or(state.current_pattern);
+                if idx >= NUM_PATTERNS {
+                    return json!({ "status": "error", "message": "Pattern index must be 0-15" });
+                }
+                ExportMode::Pattern(idx)
+            }
+            "song" => ExportMode::Song,
+            _ => {
+                return json!({
+                    "status": "error",
+                    "message": "Mode must be 'pattern' or 'song'"
+                })
+            }
+        };
+
+        match export_wav(&state, export_mode, path) {
+            Ok(result) => json!({
+                "status": "ok",
+                "path": path_str,
+                "duration_secs": result.duration_secs,
+                "samples": result.samples,
+                "message": format!("Exported {:.1}s of audio to {}", result.duration_secs, path_str)
+            }),
+            Err(e) => json!({
+                "status": "error",
+                "message": format!("Failed to export: {}", e)
+            }),
+        }
+    }
+
+    /// List .grox project files in a directory
+    pub fn list_projects(&self, directory: Option<&str>) -> Value {
+        let dir = directory.unwrap_or(".");
+        let path = Path::new(dir);
+
+        if !path.is_dir() {
+            return json!({
+                "status": "error",
+                "message": format!("Not a directory: {}", dir)
+            });
+        }
+
+        let mut files: Vec<String> = Vec::new();
+        match std::fs::read_dir(path) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().map(|e| e == "grox").unwrap_or(false) {
+                        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                            files.push(name.to_string());
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                return json!({
+                    "status": "error",
+                    "message": format!("Failed to read directory: {}", e)
+                });
+            }
+        }
+
+        files.sort();
+        json!({
+            "status": "ok",
+            "directory": dir,
+            "files": files,
+            "count": files.len()
+        })
+    }
+
     /// Handle an MCP tool call
     pub fn handle_tool_call(&self, tool: &str, args: &Value) -> Value {
         match tool {
@@ -992,6 +1112,26 @@ impl GridoxideMcp {
                 self.set_arrangement_entry(position, pattern, repeats)
             }
             "clear_arrangement" => self.clear_arrangement(),
+
+            // Project I/O
+            "save_project" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("project.grox");
+                self.save_project(path)
+            }
+            "load_project" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("project.grox");
+                self.load_project(path)
+            }
+            "export_wav" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("export.wav");
+                let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("pattern");
+                let pattern = args.get("pattern").and_then(|v| v.as_u64()).map(|n| n as usize);
+                self.export_wav_file(path, mode, pattern)
+            }
+            "list_projects" => {
+                let directory = args.get("directory").and_then(|v| v.as_str());
+                self.list_projects(directory)
+            }
 
             _ => json!({ "status": "error", "message": format!("Unknown tool: {}", tool) }),
         }
@@ -1535,6 +1675,69 @@ impl GridoxideMcp {
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
+                    }
+                },
+                {
+                    "name": "save_project",
+                    "description": "Save the current project state to a .grox JSON file.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "File path to save to (e.g., 'my_song.grox')"
+                            }
+                        },
+                        "required": ["path"]
+                    }
+                },
+                {
+                    "name": "load_project",
+                    "description": "Load a project from a .grox JSON file. Stops playback and replaces all state.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "File path to load from (e.g., 'my_song.grox')"
+                            }
+                        },
+                        "required": ["path"]
+                    }
+                },
+                {
+                    "name": "export_wav",
+                    "description": "Render and export audio as a WAV file (44100Hz, 16-bit stereo).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Output WAV file path (e.g., 'export.wav')"
+                            },
+                            "mode": {
+                                "type": "string",
+                                "description": "Export mode: 'pattern' (single pattern loop) or 'song' (full arrangement)"
+                            },
+                            "pattern": {
+                                "type": "integer",
+                                "description": "Pattern index (0-15) for pattern mode. Defaults to current pattern."
+                            }
+                        },
+                        "required": ["path", "mode"]
+                    }
+                },
+                {
+                    "name": "list_projects",
+                    "description": "List .grox project files in a directory.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "directory": {
+                                "type": "string",
+                                "description": "Directory to search (defaults to current directory)"
+                            }
+                        }
                     }
                 }
             ]
