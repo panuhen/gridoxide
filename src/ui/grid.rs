@@ -1,7 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders};
 
-use crate::sequencer::{Pattern, PlaybackMode, TrackType, STEPS, TRACKS};
+use crate::sequencer::{Pattern, PlaybackMode, DEFAULT_TRACKS, STEPS};
 use crate::synth::note_name;
 use crate::ui::Theme;
 
@@ -19,9 +19,10 @@ impl GridState {
         }
     }
 
-    pub fn move_cursor(&mut self, dx: i32, dy: i32) {
+    pub fn move_cursor(&mut self, dx: i32, dy: i32, num_tracks: usize) {
+        let tracks = if num_tracks == 0 { DEFAULT_TRACKS } else { num_tracks };
         self.cursor_step = ((self.cursor_step as i32 + dx).rem_euclid(STEPS as i32)) as usize;
-        self.cursor_track = ((self.cursor_track as i32 + dy).rem_euclid(TRACKS as i32)) as usize;
+        self.cursor_track = ((self.cursor_track as i32 + dy).rem_euclid(tracks as i32)) as usize;
     }
 }
 
@@ -59,8 +60,11 @@ pub fn render_grid(
     grid_state: &GridState,
     current_step: usize,
     playing: bool,
+    track_names: &[String],
     theme: &Theme,
 ) {
+    let num_tracks = pattern.num_tracks();
+
     // Create outer block
     let block = Block::default()
         .title(Span::styled(
@@ -79,10 +83,14 @@ pub fn render_grid(
     let label_width = 6u16;
     let available_width = inner.width.saturating_sub(label_width);
     let cell_width = (available_width / STEPS as u16).max(2);
-    let cell_height = (inner.height / TRACKS as u16).max(1);
+    let cell_height = if num_tracks > 0 {
+        (inner.height / num_tracks as u16).max(1)
+    } else {
+        1
+    };
 
     // Render each track
-    for track in 0..TRACKS {
+    for track in 0..num_tracks {
         let track_y = inner.y + (track as u16 * cell_height);
 
         if track_y >= inner.y + inner.height {
@@ -90,8 +98,11 @@ pub fn render_grid(
         }
 
         // Track label
-        let track_type = TrackType::from_index(track).unwrap();
-        let label = format!("{:>5} ", track_type.name());
+        let label = if track < track_names.len() {
+            format!("{:>5} ", track_names[track])
+        } else {
+            format!("{:>5} ", format!("TRK{}", track))
+        };
         let label_style = if track == grid_state.cursor_track {
             Style::default().fg(theme.highlight).bold()
         } else {

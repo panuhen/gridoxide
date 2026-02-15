@@ -1,4 +1,7 @@
-use super::params::{midi_to_freq, BassParams};
+use serde_json::Value;
+
+use super::params::{midi_to_freq, BassParams, DEFAULT_NOTES};
+use super::source::{ParamDescriptor, SoundSource, SynthType};
 
 /// Bass synthesizer
 /// Simple sine/saw at low frequency with sustain
@@ -104,5 +107,53 @@ impl BassSynth {
         self.phase = Some(phase + 1);
 
         osc * amp * 0.6
+    }
+}
+
+impl SoundSource for BassSynth {
+    fn synth_type(&self) -> SynthType { SynthType::Bass }
+    fn type_name(&self) -> &'static str { "BASS" }
+    fn default_note(&self) -> u8 { DEFAULT_NOTES[3] }
+    fn trigger(&mut self) { self.trigger(); }
+    fn trigger_with_note(&mut self, note: u8) { self.trigger_with_note(note); }
+    fn next_sample(&mut self) -> f32 { self.next_sample() }
+
+    fn param_descriptors(&self) -> Vec<ParamDescriptor> {
+        vec![
+            ParamDescriptor { key: "frequency".into(), name: "Frequency".into(), min: 30.0, max: 120.0, default: 55.0 },
+            ParamDescriptor { key: "decay".into(), name: "Decay".into(), min: 3.0, max: 12.0, default: 6.0 },
+            ParamDescriptor { key: "saw_mix".into(), name: "Saw Mix".into(), min: 0.0, max: 1.0, default: 0.2 },
+            ParamDescriptor { key: "sub".into(), name: "Sub".into(), min: 0.0, max: 1.0, default: 0.0 },
+        ]
+    }
+
+    fn get_param(&self, key: &str) -> Option<f32> {
+        match key {
+            "frequency" => Some(self.params.frequency),
+            "decay" => Some(self.params.decay),
+            "saw_mix" => Some(self.params.saw_mix),
+            "sub" => Some(self.params.sub),
+            _ => None,
+        }
+    }
+
+    fn set_param(&mut self, key: &str, value: f32) -> bool {
+        match key {
+            "frequency" => { self.params.frequency = value; self.active_frequency = value; true }
+            "decay" => { self.params.decay = value; true }
+            "saw_mix" => { self.params.saw_mix = value; true }
+            "sub" => { self.params.sub = value; true }
+            _ => false,
+        }
+    }
+
+    fn serialize_params(&self) -> Value {
+        serde_json::to_value(&self.params).unwrap_or(Value::Null)
+    }
+
+    fn deserialize_params(&mut self, params: &Value) {
+        if let Ok(p) = serde_json::from_value::<BassParams>(params.clone()) {
+            self.set_params(p);
+        }
     }
 }

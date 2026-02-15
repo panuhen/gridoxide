@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use crate::audio::SequencerState;
 use crate::fx::{configure_fx_chain, StereoReverb, TrackFxChain};
 use crate::sequencer::{Clock, STEPS};
-use crate::synth::{BassSynth, HiHatSynth, KickSynth, SnareSynth};
+use crate::synth::{create_synth, SoundSource};
 
 const SAMPLE_RATE: f32 = 44100.0;
 const TAIL_SECONDS: f32 = 1.0;
@@ -26,42 +26,39 @@ pub struct ExportResult {
 
 /// Offline renderer that mirrors the real-time audio callback
 struct OfflineRenderer {
-    kick: KickSynth,
-    snare: SnareSynth,
-    hihat: HiHatSynth,
-    bass: BassSynth,
+    synths: Vec<Box<dyn SoundSource>>,
     clock: Clock,
-    fx_chains: [TrackFxChain; 4],
+    fx_chains: Vec<TrackFxChain>,
     reverb: StereoReverb,
     reverb_enabled: bool,
-    volumes: [f32; 4],
-    pans: [f32; 4],
-    mutes: [bool; 4],
-    solos: [bool; 4],
+    volumes: Vec<f32>,
+    pans: Vec<f32>,
+    mutes: Vec<bool>,
+    solos: Vec<bool>,
 }
 
 impl OfflineRenderer {
     fn from_state(state: &SequencerState) -> Self {
-        let mut kick = KickSynth::new(SAMPLE_RATE);
-        kick.set_params(state.kick_params.clone());
-        let mut snare = SnareSynth::new(SAMPLE_RATE);
-        snare.set_params(state.snare_params.clone());
-        let mut hihat = HiHatSynth::new(SAMPLE_RATE);
-        hihat.set_params(state.hihat_params.clone());
-        let mut bass = BassSynth::new(SAMPLE_RATE);
-        bass.set_params(state.bass_params.clone());
+        let mut synths: Vec<Box<dyn SoundSource>> = Vec::with_capacity(state.tracks.len());
+        let mut volumes = Vec::with_capacity(state.tracks.len());
+        let mut pans = Vec::with_capacity(state.tracks.len());
+        let mut mutes = Vec::with_capacity(state.tracks.len());
+        let mut solos = Vec::with_capacity(state.tracks.len());
+        let mut fx_chains = Vec::with_capacity(state.tracks.len());
+
+        for track in &state.tracks {
+            let synth = create_synth(track.synth_type, SAMPLE_RATE, Some(&track.params_snapshot));
+            synths.push(synth);
+            volumes.push(track.volume);
+            pans.push(track.pan);
+            mutes.push(track.mute);
+            solos.push(track.solo);
+            let mut chain = TrackFxChain::new(SAMPLE_RATE);
+            configure_fx_chain(&mut chain, &track.fx);
+            fx_chains.push(chain);
+        }
 
         let clock = Clock::new(SAMPLE_RATE, state.bpm);
-
-        let mut fx_chains = [
-            TrackFxChain::new(SAMPLE_RATE),
-            TrackFxChain::new(SAMPLE_RATE),
-            TrackFxChain::new(SAMPLE_RATE),
-            TrackFxChain::new(SAMPLE_RATE),
-        ];
-        for i in 0..4 {
-            configure_fx_chain(&mut fx_chains[i], &state.track_fx[i]);
-        }
 
         let mut reverb = StereoReverb::new(SAMPLE_RATE);
         reverb.set_decay(state.master_fx.reverb_decay);
@@ -69,18 +66,15 @@ impl OfflineRenderer {
         reverb.set_damping(state.master_fx.reverb_damping);
 
         Self {
-            kick,
-            snare,
-            hihat,
-            bass,
+            synths,
             clock,
             fx_chains,
             reverb,
             reverb_enabled: state.master_fx.reverb_enabled,
-            volumes: state.track_volumes,
-            pans: state.track_pans,
-            mutes: state.track_mutes,
-            solos: state.track_solos,
+            volumes,
+            pans,
+            mutes,
+            solos,
         }
     }
 
@@ -91,11 +85,11 @@ impl OfflineRenderer {
         mode: &ExportMode,
     ) -> Vec<(f32, f32)> {
         let tail_samples = (SAMPLE_RATE * TAIL_SECONDS) as usize;
+        let num_tracks = self.synths.len();
 
         // Calculate total pattern steps to render
         let total_steps = match mode {
-            ExportMode::Pattern(idx) => {
-                let _ = idx; // pattern data accessed via state.pattern_bank
+            ExportMode::Pattern(_idx) => {
                 STEPS // one loop = 16 steps
             }
             ExportMode::Song => {
@@ -143,21 +137,11 @@ impl OfflineRenderer {
                 // Check for step trigger
                 if let Some(step) = self.clock.tick() {
                     let pat = state.pattern_bank.get(current_pattern_idx);
-                    let s0 = pat.get_step(0, step);
-                    if s0.active {
-                        self.kick.trigger_with_note(s0.note);
-                    }
-                    let s1 = pat.get_step(1, step);
-                    if s1.active {
-                        self.snare.trigger_with_note(s1.note);
-                    }
-                    let s2 = pat.get_step(2, step);
-                    if s2.active {
-                        self.hihat.trigger_with_note(s2.note);
-                    }
-                    let s3 = pat.get_step(3, step);
-                    if s3.active {
-                        self.bass.trigger_with_note(s3.note);
+                    for i in 0..num_tracks {
+                        let sd = pat.get_step(i, step);
+                        if sd.active {
+                            self.synths[i].trigger_with_note(sd.note);
+                        }
                     }
                 }
 
@@ -174,30 +158,22 @@ impl OfflineRenderer {
                                     current_pattern_idx =
                                         state.arrangement.entries[arrangement_pos].pattern;
                                 }
-                                // If we've passed the end, the content_samples limit
-                                // will stop triggering new steps
                             }
                         }
                     }
                 }
             } else {
-                // In tail: just advance clock without triggering (for take_pattern_wrap)
+                // In tail: just advance clock without triggering
                 self.clock.tick();
                 self.clock.take_pattern_wrap();
             }
 
             // Generate audio (always, including tail for decay)
-            let raw = [
-                self.fx_chains[0].process(self.kick.next_sample()),
-                self.fx_chains[1].process(self.snare.next_sample()),
-                self.fx_chains[2].process(self.hihat.next_sample()),
-                self.fx_chains[3].process(self.bass.next_sample()),
-            ];
-
             let any_solo = self.solos.iter().any(|&s| s);
             let mut left = 0.0f32;
             let mut right = 0.0f32;
-            for i in 0..4 {
+            for i in 0..num_tracks {
+                let raw = self.fx_chains[i].process(self.synths[i].next_sample());
                 let audible = if any_solo {
                     self.solos[i]
                 } else {
@@ -206,7 +182,7 @@ impl OfflineRenderer {
                 if !audible {
                     continue;
                 }
-                let s = raw[i] * self.volumes[i];
+                let s = raw * self.volumes[i];
                 let angle = (self.pans[i] + 1.0) * 0.25 * std::f32::consts::PI;
                 left += s * angle.cos();
                 right += s * angle.sin();

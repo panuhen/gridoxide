@@ -1,4 +1,7 @@
+use serde_json::Value;
+
 use super::params::{midi_to_freq, HiHatParams, DEFAULT_NOTES};
+use super::source::{ParamDescriptor, SoundSource, SynthType};
 
 /// Hi-hat synthesizer
 /// High-passed noise with very short envelope
@@ -100,5 +103,56 @@ impl HiHatSynth {
         self.phase = Some(phase + 1);
 
         filtered * amp * 0.4
+    }
+}
+
+impl SoundSource for HiHatSynth {
+    fn synth_type(&self) -> SynthType { SynthType::HiHat }
+    fn type_name(&self) -> &'static str { "HIHAT" }
+    fn default_note(&self) -> u8 { DEFAULT_NOTES[2] }
+    fn trigger(&mut self) { self.trigger(); }
+    fn trigger_with_note(&mut self, note: u8) { self.trigger_with_note(note); }
+    fn next_sample(&mut self) -> f32 { self.next_sample() }
+
+    fn param_descriptors(&self) -> Vec<ParamDescriptor> {
+        vec![
+            ParamDescriptor { key: "decay".into(), name: "Decay".into(), min: 20.0, max: 100.0, default: 40.0 },
+            ParamDescriptor { key: "tone".into(), name: "Tone".into(), min: 0.0, max: 1.0, default: 0.5 },
+            ParamDescriptor { key: "open".into(), name: "Open".into(), min: 0.0, max: 1.0, default: 0.0 },
+        ]
+    }
+
+    fn get_param(&self, key: &str) -> Option<f32> {
+        match key {
+            "decay" => Some(self.params.decay),
+            "tone" => Some(self.params.tone),
+            "open" => Some(self.params.open),
+            _ => None,
+        }
+    }
+
+    fn set_param(&mut self, key: &str, value: f32) -> bool {
+        match key {
+            "decay" => { self.params.decay = value; true }
+            "tone" => { self.params.tone = value; true }
+            "open" => {
+                self.params.open = value;
+                let base_duration = if self.params.open > 0.5 { 0.2 } else { 0.05 };
+                let open_factor = 1.0 + self.params.open * 3.0;
+                self.duration_samples = (self.sample_rate * base_duration * open_factor) as usize;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn serialize_params(&self) -> Value {
+        serde_json::to_value(&self.params).unwrap_or(Value::Null)
+    }
+
+    fn deserialize_params(&mut self, params: &Value) {
+        if let Ok(p) = serde_json::from_value::<HiHatParams>(params.clone()) {
+            self.set_params(p);
+        }
     }
 }

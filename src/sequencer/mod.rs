@@ -3,6 +3,5 @@ pub mod pattern;
 
 pub use clock::Clock;
 pub use pattern::{
-    Arrangement, ArrangementEntry, Pattern, PatternBank, PlaybackMode, StepData, TrackType,
-    MAX_ARRANGEMENT_ENTRIES, NUM_PATTERNS, STEPS, TRACKS,
+    Arrangement, Pattern, PatternBank, PlaybackMode, DEFAULT_TRACKS, NUM_PATTERNS, STEPS,
 };

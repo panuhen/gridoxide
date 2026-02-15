@@ -2,8 +2,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::audio::SequencerState;
-use crate::sequencer::TrackType;
-use crate::synth::ParamId;
+use crate::synth::ParamDescriptor;
 use crate::ui::Theme;
 
 /// State for parameter editor view
@@ -20,25 +19,18 @@ impl ParamEditorState {
         }
     }
 
-    /// Get currently selected parameter
-    pub fn current_param(&self) -> Option<ParamId> {
-        let params = ParamId::params_for_track(self.track);
-        params.get(self.param_index).copied()
-    }
-
     /// Move parameter selection up/down
-    pub fn move_selection(&mut self, dy: i32) {
-        let params = ParamId::params_for_track(self.track);
-        if params.is_empty() {
+    pub fn move_selection(&mut self, dy: i32, param_count: usize) {
+        if param_count == 0 {
             return;
         }
-        let len = params.len() as i32;
+        let len = param_count as i32;
         self.param_index = ((self.param_index as i32 + dy).rem_euclid(len)) as usize;
     }
 
     /// Switch to a different track
-    pub fn switch_track(&mut self, track: usize) {
-        if track < 4 {
+    pub fn switch_track(&mut self, track: usize, num_tracks: usize) {
+        if track < num_tracks {
             self.track = track;
             self.param_index = 0;
         }
@@ -51,28 +43,26 @@ impl Default for ParamEditorState {
     }
 }
 
-/// Get the current value of a parameter from state
-pub fn get_param_value(state: &SequencerState, param: ParamId) -> f32 {
-    match param {
-        ParamId::KickPitchStart => state.kick_params.pitch_start,
-        ParamId::KickPitchEnd => state.kick_params.pitch_end,
-        ParamId::KickPitchDecay => state.kick_params.pitch_decay,
-        ParamId::KickAmpDecay => state.kick_params.amp_decay,
-        ParamId::KickClick => state.kick_params.click,
-        ParamId::KickDrive => state.kick_params.drive,
-        ParamId::SnareToneFreq => state.snare_params.tone_freq,
-        ParamId::SnareToneDecay => state.snare_params.tone_decay,
-        ParamId::SnareNoiseDecay => state.snare_params.noise_decay,
-        ParamId::SnareToneMix => state.snare_params.tone_mix,
-        ParamId::SnareSnappy => state.snare_params.snappy,
-        ParamId::HiHatDecay => state.hihat_params.decay,
-        ParamId::HiHatTone => state.hihat_params.tone,
-        ParamId::HiHatOpen => state.hihat_params.open,
-        ParamId::BassFrequency => state.bass_params.frequency,
-        ParamId::BassDecay => state.bass_params.decay,
-        ParamId::BassSawMix => state.bass_params.saw_mix,
-        ParamId::BassSub => state.bass_params.sub,
+/// Get parameter descriptors for a track from state
+pub fn get_param_descriptors(state: &SequencerState, track: usize) -> Vec<ParamDescriptor> {
+    if track >= state.tracks.len() {
+        return vec![];
     }
+    // Deserialize from params_snapshot to get descriptors
+    // We use the factory to create a temp synth just for descriptors
+    // But actually we can get descriptors from the snapshot by using create_synth
+    use crate::synth::create_synth;
+    let synth = create_synth(state.tracks[track].synth_type, 44100.0, None);
+    synth.param_descriptors()
+}
+
+/// Get a parameter value from the state's params_snapshot
+pub fn get_snapshot_param_value(state: &SequencerState, track: usize, key: &str) -> f32 {
+    if track >= state.tracks.len() {
+        return 0.0;
+    }
+    let snapshot = &state.tracks[track].params_snapshot;
+    snapshot.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32
 }
 
 /// Render the parameter editor view
@@ -106,18 +96,17 @@ pub fn render_params(
         .split(inner);
 
     // Render track tabs
-    render_track_tabs(frame, chunks[0], editor.track, theme);
+    render_track_tabs(frame, chunks[0], state, editor.track, theme);
 
     // Render parameters for selected track
     render_param_list(frame, chunks[1], state, editor, theme);
 }
 
 /// Render track selection tabs
-fn render_track_tabs(frame: &mut Frame, area: Rect, selected: usize, theme: &Theme) {
-    let tracks = ["1:KICK", "2:SNARE", "3:HIHAT", "4:BASS"];
-
+fn render_track_tabs(frame: &mut Frame, area: Rect, state: &SequencerState, selected: usize, theme: &Theme) {
     let mut spans = Vec::new();
-    for (i, name) in tracks.iter().enumerate() {
+    for (i, track) in state.tracks.iter().enumerate() {
+        let label = format!("{}:{}", i + 1, track.name);
         let style = if i == selected {
             Style::default()
                 .fg(theme.bg)
@@ -126,8 +115,8 @@ fn render_track_tabs(frame: &mut Frame, area: Rect, selected: usize, theme: &The
         } else {
             Style::default().fg(theme.dimmed)
         };
-        spans.push(Span::styled(format!(" {} ", name), style));
-        if i < 3 {
+        spans.push(Span::styled(format!(" {} ", label), style));
+        if i < state.tracks.len() - 1 {
             spans.push(Span::styled(" ", Style::default()));
         }
     }
@@ -147,17 +136,17 @@ fn render_param_list(
     editor: &ParamEditorState,
     theme: &Theme,
 ) {
-    let params = ParamId::params_for_track(editor.track);
+    let descriptors = get_param_descriptors(state, editor.track);
 
     let mut lines = Vec::new();
 
-    for (i, param) in params.iter().enumerate() {
+    for (i, desc) in descriptors.iter().enumerate() {
         let is_selected = i == editor.param_index;
-        let value = get_param_value(state, *param);
-        let (min, max, _default) = param.range();
+        let value = get_snapshot_param_value(state, editor.track, &desc.key);
 
         // Calculate normalized value (0-1)
-        let normalized = (value - min) / (max - min);
+        let range = desc.max - desc.min;
+        let normalized = if range > 0.0 { (value - desc.min) / range } else { 0.0 };
 
         // Create value bar
         let bar_width = 20;
@@ -167,7 +156,7 @@ fn render_param_list(
             .collect();
 
         // Format the line
-        let name = format!("{:>12}", param.name());
+        let name = format!("{:>12}", desc.name);
         let value_str = format!("{:>7.1}", value);
 
         let style = if is_selected {

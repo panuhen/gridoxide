@@ -3,9 +3,7 @@ pub mod hihat;
 pub mod kick;
 pub mod params;
 pub mod snare;
+pub mod source;
 
-pub use bass::BassSynth;
-pub use hihat::HiHatSynth;
-pub use kick::KickSynth;
-pub use params::{midi_to_freq, note_name, BassParams, HiHatParams, KickParams, ParamId, SnareParams, DEFAULT_NOTES};
-pub use snare::SnareSynth;
+pub use params::{note_name, BassParams, HiHatParams, KickParams, SnareParams};
+pub use source::{create_synth, ParamDescriptor, SoundSource, SynthType};

@@ -52,8 +52,8 @@ impl MixerState {
         }
     }
 
-    pub fn select_track(&mut self, track: usize) {
-        if track < 4 {
+    pub fn select_track(&mut self, track: usize, num_tracks: usize) {
+        if track < num_tracks {
             self.selected_track = track;
         }
     }
@@ -79,6 +79,8 @@ pub fn render_mixer(
     mixer_state: &MixerState,
     theme: &Theme,
 ) {
+    let num_tracks = state.tracks.len();
+
     let block = Block::default()
         .title(Span::styled(
             " Mixer ",
@@ -90,6 +92,10 @@ pub fn render_mixer(
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    if num_tracks == 0 {
+        return;
+    }
 
     // Layout: track headers, faders, values
     let chunks = Layout::default()
@@ -104,13 +110,11 @@ pub fn render_mixer(
         ])
         .split(inner);
 
-    let track_names = ["KICK", "SNARE", "HIHAT", "BASS"];
-
     // Calculate column width for each track
-    let col_width = (inner.width / 4).max(8);
+    let col_width = (inner.width / num_tracks as u16).max(8);
 
     // Track headers
-    render_track_headers(frame, chunks[0], track_names, mixer_state, col_width, theme);
+    render_track_headers(frame, chunks[0], state, mixer_state, col_width, theme);
 
     // Volume faders (vertical bars)
     render_volume_faders(frame, chunks[1], state, mixer_state, col_width, theme);
@@ -119,12 +123,12 @@ pub fn render_mixer(
     render_value_row(
         frame,
         chunks[2],
-        &state.track_volumes,
+        state,
         mixer_state,
         MixerField::Volume,
         col_width,
         theme,
-        |v| format!("{:.2}", v),
+        |t| format!("{:.2}", t.volume),
         "VOL",
     );
 
@@ -132,16 +136,16 @@ pub fn render_mixer(
     render_value_row(
         frame,
         chunks[3],
-        &state.track_pans,
+        state,
         mixer_state,
         MixerField::Pan,
         col_width,
         theme,
-        |v| {
-            if *v < -0.05 {
-                format!("L{:.1}", -v)
-            } else if *v > 0.05 {
-                format!("R{:.1}", v)
+        |t| {
+            if t.pan < -0.05 {
+                format!("L{:.1}", -t.pan)
+            } else if t.pan > 0.05 {
+                format!("R{:.1}", t.pan)
             } else {
                 "C".to_string()
             }
@@ -153,11 +157,12 @@ pub fn render_mixer(
     render_toggle_row(
         frame,
         chunks[4],
-        &state.track_mutes,
+        state,
         mixer_state,
         MixerField::Mute,
         col_width,
         theme,
+        |t| t.mute,
         "M",
         "MUTE",
     );
@@ -166,11 +171,12 @@ pub fn render_mixer(
     render_toggle_row(
         frame,
         chunks[5],
-        &state.track_solos,
+        state,
         mixer_state,
         MixerField::Solo,
         col_width,
         theme,
+        |t| t.solo,
         "S",
         "SOLO",
     );
@@ -179,12 +185,13 @@ pub fn render_mixer(
 fn render_track_headers(
     frame: &mut Frame,
     area: Rect,
-    names: [&str; 4],
+    state: &SequencerState,
     mixer_state: &MixerState,
     col_width: u16,
     theme: &Theme,
 ) {
-    for (i, name) in names.iter().enumerate() {
+    let num_tracks = state.tracks.len();
+    for i in 0..num_tracks {
         let x = area.x + i as u16 * col_width;
         if x >= area.x + area.width {
             break;
@@ -199,7 +206,7 @@ fn render_track_headers(
             Style::default().fg(theme.track_label)
         };
 
-        let label = format!("{:^width$}", name, width = col_width as usize);
+        let label = format!("{:^width$}", state.tracks[i].name, width = col_width as usize);
         frame.render_widget(
             Paragraph::new(label).style(style),
             Rect::new(x, area.y, col_width, 1),
@@ -220,20 +227,22 @@ fn render_volume_faders(
         return;
     }
 
-    for track in 0..4 {
+    let num_tracks = state.tracks.len();
+    let any_solo = state.tracks.iter().any(|t| t.solo);
+
+    for track in 0..num_tracks {
         let x = area.x + track as u16 * col_width;
         if x >= area.x + area.width {
             break;
         }
 
-        let volume = state.track_volumes[track];
+        let volume = state.tracks[track].volume;
         let filled = (volume * fader_height as f32).round() as u16;
         let is_selected =
             track == mixer_state.selected_track && mixer_state.selected_field == MixerField::Volume;
-        let is_muted = state.track_mutes[track];
-        let any_solo = state.track_solos.iter().any(|&s| s);
+        let is_muted = state.tracks[track].mute;
         let is_audible = if any_solo {
-            state.track_solos[track]
+            state.tracks[track].solo
         } else {
             !is_muted
         };
@@ -269,7 +278,7 @@ fn render_volume_faders(
                 Style::default().fg(theme.grid_inactive).bg(theme.bg)
             };
 
-            let block_char = if is_filled { "█" } else { "░" };
+            let block_char = if is_filled { "\u{2588}" } else { "\u{2591}" };
             let bar: String = block_char.repeat(bar_width as usize);
             frame.render_widget(
                 Paragraph::new(bar).style(style),
@@ -282,7 +291,7 @@ fn render_volume_faders(
 fn render_value_row<F>(
     frame: &mut Frame,
     area: Rect,
-    values: &[f32; 4],
+    state: &SequencerState,
     mixer_state: &MixerState,
     field: MixerField,
     col_width: u16,
@@ -290,9 +299,10 @@ fn render_value_row<F>(
     format_fn: F,
     label: &str,
 ) where
-    F: Fn(&f32) -> String,
+    F: Fn(&crate::audio::TrackState) -> String,
 {
-    for track in 0..4 {
+    let num_tracks = state.tracks.len();
+    for track in 0..num_tracks {
         let x = area.x + track as u16 * col_width;
         if x >= area.x + area.width {
             break;
@@ -307,7 +317,7 @@ fn render_value_row<F>(
             Style::default().fg(theme.fg)
         };
 
-        let text = format_fn(&values[track]);
+        let text = format_fn(&state.tracks[track]);
         let display = format!("{:^width$}", text, width = col_width as usize);
         frame.render_widget(
             Paragraph::new(display).style(style),
@@ -316,27 +326,31 @@ fn render_value_row<F>(
     }
 
     // Row label on the right if space allows
-    let label_x = area.x + 4 * col_width;
+    let label_x = area.x + num_tracks as u16 * col_width;
     if label_x + label.len() as u16 <= area.x + area.width {
         frame.render_widget(
             Paragraph::new(format!(" {}", label)).style(Style::default().fg(theme.dimmed)),
-            Rect::new(label_x, area.y, (area.width - 4 * col_width).min(6), 1),
+            Rect::new(label_x, area.y, (area.width - num_tracks as u16 * col_width).min(6), 1),
         );
     }
 }
 
-fn render_toggle_row(
+fn render_toggle_row<F>(
     frame: &mut Frame,
     area: Rect,
-    values: &[bool; 4],
+    state: &SequencerState,
     mixer_state: &MixerState,
     field: MixerField,
     col_width: u16,
     theme: &Theme,
+    get_value: F,
     active_char: &str,
     label: &str,
-) {
-    for track in 0..4 {
+) where
+    F: Fn(&crate::audio::TrackState) -> bool,
+{
+    let num_tracks = state.tracks.len();
+    for track in 0..num_tracks {
         let x = area.x + track as u16 * col_width;
         if x >= area.x + area.width {
             break;
@@ -344,7 +358,7 @@ fn render_toggle_row(
 
         let is_selected =
             track == mixer_state.selected_track && mixer_state.selected_field == field;
-        let is_active = values[track];
+        let is_active = get_value(&state.tracks[track]);
 
         let text = if is_active {
             format!("[{}]", active_char)
@@ -375,11 +389,11 @@ fn render_toggle_row(
     }
 
     // Row label
-    let label_x = area.x + 4 * col_width;
+    let label_x = area.x + num_tracks as u16 * col_width;
     if label_x + label.len() as u16 <= area.x + area.width {
         frame.render_widget(
             Paragraph::new(format!(" {}", label)).style(Style::default().fg(theme.dimmed)),
-            Rect::new(label_x, area.y, (area.width - 4 * col_width).min(6), 1),
+            Rect::new(label_x, area.y, (area.width - num_tracks as u16 * col_width).min(6), 1),
         );
     }
 }

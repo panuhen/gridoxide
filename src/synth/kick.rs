@@ -1,4 +1,7 @@
+use serde_json::Value;
+
 use super::params::{midi_to_freq, KickParams, DEFAULT_NOTES};
+use super::source::{ParamDescriptor, SoundSource, SynthType};
 
 /// Kick drum synthesizer state
 pub struct KickSynth {
@@ -109,5 +112,63 @@ impl KickSynth {
         }
 
         sample
+    }
+}
+
+impl SoundSource for KickSynth {
+    fn synth_type(&self) -> SynthType { SynthType::Kick }
+    fn type_name(&self) -> &'static str { "KICK" }
+    fn default_note(&self) -> u8 { DEFAULT_NOTES[0] }
+    fn trigger(&mut self) { self.trigger(); }
+    fn trigger_with_note(&mut self, note: u8) { self.trigger_with_note(note); }
+    fn next_sample(&mut self) -> f32 { self.next_sample() }
+
+    fn param_descriptors(&self) -> Vec<ParamDescriptor> {
+        vec![
+            ParamDescriptor { key: "pitch_start".into(), name: "Pitch Start".into(), min: 80.0, max: 250.0, default: 150.0 },
+            ParamDescriptor { key: "pitch_end".into(), name: "Pitch End".into(), min: 30.0, max: 80.0, default: 50.0 },
+            ParamDescriptor { key: "pitch_decay".into(), name: "Pitch Decay".into(), min: 4.0, max: 20.0, default: 8.0 },
+            ParamDescriptor { key: "amp_decay".into(), name: "Amp Decay".into(), min: 5.0, max: 20.0, default: 10.0 },
+            ParamDescriptor { key: "click".into(), name: "Click".into(), min: 0.0, max: 1.0, default: 0.3 },
+            ParamDescriptor { key: "drive".into(), name: "Drive".into(), min: 0.0, max: 1.0, default: 0.0 },
+        ]
+    }
+
+    fn get_param(&self, key: &str) -> Option<f32> {
+        match key {
+            "pitch_start" => Some(self.params.pitch_start),
+            "pitch_end" => Some(self.params.pitch_end),
+            "pitch_decay" => Some(self.params.pitch_decay),
+            "amp_decay" => Some(self.params.amp_decay),
+            "click" => Some(self.params.click),
+            "drive" => Some(self.params.drive),
+            _ => None,
+        }
+    }
+
+    fn set_param(&mut self, key: &str, value: f32) -> bool {
+        match key {
+            "pitch_start" => { self.params.pitch_start = value; true }
+            "pitch_end" => { self.params.pitch_end = value; true }
+            "pitch_decay" => { self.params.pitch_decay = value; true }
+            "amp_decay" => {
+                self.params.amp_decay = value;
+                self.duration_samples = (self.sample_rate * (0.1 + 0.2 * (20.0 - self.params.amp_decay) / 15.0)) as usize;
+                true
+            }
+            "click" => { self.params.click = value; true }
+            "drive" => { self.params.drive = value; true }
+            _ => false,
+        }
+    }
+
+    fn serialize_params(&self) -> Value {
+        serde_json::to_value(&self.params).unwrap_or(Value::Null)
+    }
+
+    fn deserialize_params(&mut self, params: &Value) {
+        if let Ok(p) = serde_json::from_value::<KickParams>(params.clone()) {
+            self.set_params(p);
+        }
     }
 }

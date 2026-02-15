@@ -4,17 +4,45 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::audio::SequencerState;
+use crate::audio::{SequencerState, TrackState};
 use crate::fx::{MasterFxState, TrackFxState};
 use crate::sequencer::{Arrangement, PatternBank, PlaybackMode};
-use crate::synth::{BassParams, HiHatParams, KickParams, SnareParams};
+use crate::synth::{BassParams, HiHatParams, KickParams, SnareParams, SynthType};
 
-const PROJECT_VERSION: u32 = 1;
+const PROJECT_VERSION: u32 = 2;
 
-/// Serializable project data (excludes runtime-only fields like playing, current_step)
+/// Per-track data for v2 project files
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TrackProjectData {
+    pub synth_type: SynthType,
+    pub name: String,
+    pub default_note: u8,
+    pub params: Value,
+    pub volume: f32,
+    pub pan: f32,
+    pub mute: bool,
+    pub solo: bool,
+    pub fx: TrackFxState,
+}
+
+/// Serializable project data v2 (dynamic tracks)
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ProjectData {
+    pub version: u32,
+    pub bpm: f32,
+    pub tracks: Vec<TrackProjectData>,
+    pub master_fx: MasterFxState,
+    pub pattern_bank: PatternBank,
+    pub current_pattern: usize,
+    pub playback_mode: PlaybackMode,
+    pub arrangement: Arrangement,
+}
+
+/// v1 project data format (for migration from old .grox files)
+#[derive(Clone, Serialize, Deserialize)]
+struct ProjectDataV1 {
     pub version: u32,
     pub bpm: f32,
     pub kick_params: KickParams,
@@ -33,21 +61,67 @@ pub struct ProjectData {
     pub arrangement: Arrangement,
 }
 
+impl ProjectDataV1 {
+    fn migrate(self) -> ProjectData {
+        let v1_synths = [
+            (SynthType::Kick, "KICK", 36u8, serde_json::to_value(&self.kick_params).unwrap_or(Value::Null)),
+            (SynthType::Snare, "SNARE", 50u8, serde_json::to_value(&self.snare_params).unwrap_or(Value::Null)),
+            (SynthType::HiHat, "HIHAT", 60u8, serde_json::to_value(&self.hihat_params).unwrap_or(Value::Null)),
+            (SynthType::Bass, "BASS", 33u8, serde_json::to_value(&self.bass_params).unwrap_or(Value::Null)),
+        ];
+
+        let tracks: Vec<TrackProjectData> = v1_synths
+            .iter()
+            .enumerate()
+            .map(|(i, (synth_type, name, default_note, params))| TrackProjectData {
+                synth_type: *synth_type,
+                name: name.to_string(),
+                default_note: *default_note,
+                params: params.clone(),
+                volume: self.track_volumes[i],
+                pan: self.track_pans[i],
+                mute: self.track_mutes[i],
+                solo: self.track_solos[i],
+                fx: self.track_fx[i].clone(),
+            })
+            .collect();
+
+        ProjectData {
+            version: PROJECT_VERSION,
+            bpm: self.bpm,
+            tracks,
+            master_fx: self.master_fx,
+            pattern_bank: self.pattern_bank,
+            current_pattern: self.current_pattern,
+            playback_mode: self.playback_mode,
+            arrangement: self.arrangement,
+        }
+    }
+}
+
 impl ProjectData {
     /// Snapshot the current sequencer state into a serializable project
     pub fn from_state(state: &SequencerState) -> Self {
+        let tracks: Vec<TrackProjectData> = state
+            .tracks
+            .iter()
+            .map(|t| TrackProjectData {
+                synth_type: t.synth_type,
+                name: t.name.clone(),
+                default_note: t.default_note,
+                params: t.params_snapshot.clone(),
+                volume: t.volume,
+                pan: t.pan,
+                mute: t.mute,
+                solo: t.solo,
+                fx: t.fx.clone(),
+            })
+            .collect();
+
         Self {
             version: PROJECT_VERSION,
             bpm: state.bpm,
-            kick_params: state.kick_params.clone(),
-            snare_params: state.snare_params.clone(),
-            hihat_params: state.hihat_params.clone(),
-            bass_params: state.bass_params.clone(),
-            track_volumes: state.track_volumes,
-            track_pans: state.track_pans,
-            track_mutes: state.track_mutes,
-            track_solos: state.track_solos,
-            track_fx: state.track_fx.clone(),
+            tracks,
             master_fx: state.master_fx.clone(),
             pattern_bank: state.pattern_bank.clone(),
             current_pattern: state.current_pattern,
@@ -59,20 +133,28 @@ impl ProjectData {
     /// Reconstruct a SequencerState from project data (runtime fields default)
     pub fn to_state(&self) -> SequencerState {
         let pattern = self.pattern_bank.get(self.current_pattern).clone();
+        let tracks: Vec<TrackState> = self
+            .tracks
+            .iter()
+            .map(|t| TrackState {
+                synth_type: t.synth_type,
+                name: t.name.clone(),
+                default_note: t.default_note,
+                params_snapshot: t.params.clone(),
+                volume: t.volume,
+                pan: t.pan,
+                mute: t.mute,
+                solo: t.solo,
+                fx: t.fx.clone(),
+            })
+            .collect();
+
         SequencerState {
             playing: false,
             bpm: self.bpm,
             current_step: 0,
             pattern,
-            kick_params: self.kick_params.clone(),
-            snare_params: self.snare_params.clone(),
-            hihat_params: self.hihat_params.clone(),
-            bass_params: self.bass_params.clone(),
-            track_volumes: self.track_volumes,
-            track_pans: self.track_pans,
-            track_mutes: self.track_mutes,
-            track_solos: self.track_solos,
-            track_fx: self.track_fx.clone(),
+            tracks,
             master_fx: self.master_fx.clone(),
             pattern_bank: self.pattern_bank.clone(),
             current_pattern: self.current_pattern,
@@ -94,18 +176,34 @@ pub fn save_project(state: &SequencerState, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Load a project from a .grox JSON file
+/// Load a project from a .grox JSON file (supports v1 migration)
 pub fn load_project(path: &Path) -> Result<ProjectData> {
     let json = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    let project: ProjectData = serde_json::from_str(&json)
+
+    // Peek at version to determine format
+    let raw: Value = serde_json::from_str(&json)
         .with_context(|| format!("Failed to parse {}", path.display()))?;
-    if project.version > PROJECT_VERSION {
+
+    let version = raw.get("version").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+
+    if version > PROJECT_VERSION {
         bail!(
             "Project version {} is newer than supported version {}",
-            project.version,
+            version,
             PROJECT_VERSION
         );
     }
-    Ok(project)
+
+    if version <= 1 {
+        // v1 format: migrate to v2
+        let v1: ProjectDataV1 = serde_json::from_value(raw)
+            .with_context(|| format!("Failed to parse v1 project {}", path.display()))?;
+        Ok(v1.migrate())
+    } else {
+        // v2 format
+        let project: ProjectData = serde_json::from_value(raw)
+            .with_context(|| format!("Failed to parse v2 project {}", path.display()))?;
+        Ok(project)
+    }
 }

@@ -1,11 +1,17 @@
 use serde::{Deserialize, Serialize};
 
-use crate::synth::DEFAULT_NOTES;
-
 pub const STEPS: usize = 16;
-pub const TRACKS: usize = 4;
+pub const DEFAULT_TRACKS: usize = 4;
 pub const NUM_PATTERNS: usize = 16;
 pub const MAX_ARRANGEMENT_ENTRIES: usize = 64;
+
+/// Default MIDI notes for the 4 built-in tracks
+pub const DEFAULT_NOTES: [u8; 4] = [
+    36, // Kick: C2
+    50, // Snare: D3
+    60, // HiHat: C4
+    33, // Bass: A1 (55 Hz)
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlaybackMode {
@@ -91,8 +97,12 @@ pub struct PatternBank {
 
 impl PatternBank {
     pub fn new() -> Self {
+        Self::new_with_tracks(DEFAULT_TRACKS)
+    }
+
+    pub fn new_with_tracks(num_tracks: usize) -> Self {
         Self {
-            patterns: (0..NUM_PATTERNS).map(|_| Pattern::new()).collect(),
+            patterns: (0..NUM_PATTERNS).map(|_| Pattern::new_with_tracks(num_tracks)).collect(),
         }
     }
 
@@ -109,9 +119,10 @@ impl PatternBank {
         if index >= NUM_PATTERNS {
             return false;
         }
-        for track in 0..TRACKS {
+        let pat = &self.patterns[index];
+        for track in 0..pat.num_tracks() {
             for step in 0..STEPS {
-                if self.patterns[index].get(track, step) {
+                if pat.get(track, step) {
                     return true;
                 }
             }
@@ -123,35 +134,6 @@ impl PatternBank {
 impl Default for PatternBank {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TrackType {
-    Kick = 0,
-    Snare = 1,
-    HiHat = 2,
-    Bass = 3,
-}
-
-impl TrackType {
-    pub fn name(&self) -> &'static str {
-        match self {
-            TrackType::Kick => "KICK",
-            TrackType::Snare => "SNARE",
-            TrackType::HiHat => "HIHAT",
-            TrackType::Bass => "BASS",
-        }
-    }
-
-    pub fn from_index(index: usize) -> Option<Self> {
-        match index {
-            0 => Some(TrackType::Kick),
-            1 => Some(TrackType::Snare),
-            2 => Some(TrackType::HiHat),
-            3 => Some(TrackType::Bass),
-            _ => None,
-        }
     }
 }
 
@@ -179,26 +161,57 @@ impl StepData {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pattern {
-    /// steps[track][step]
-    pub steps: [[StepData; STEPS]; TRACKS],
+    /// steps[track][step] - dynamic number of tracks
+    pub steps: Vec<[StepData; STEPS]>,
 }
 
 impl Pattern {
     pub fn new() -> Self {
-        let mut steps = [[StepData::off(60); STEPS]; TRACKS];
-        // Initialize each track with its default note
-        for track in 0..TRACKS {
-            let default_note = DEFAULT_NOTES[track];
-            for step in 0..STEPS {
-                steps[track][step] = StepData::off(default_note);
-            }
+        Self::new_with_tracks(DEFAULT_TRACKS)
+    }
+
+    pub fn new_with_tracks(num_tracks: usize) -> Self {
+        let mut steps = Vec::with_capacity(num_tracks);
+        for track in 0..num_tracks {
+            let default_note = if track < DEFAULT_NOTES.len() {
+                DEFAULT_NOTES[track]
+            } else {
+                60 // C4 for any extra tracks
+            };
+            steps.push([StepData::off(default_note); STEPS]);
         }
         Self { steps }
     }
 
+    /// Create a pattern with specific default notes per track
+    pub fn new_with_notes(default_notes: &[u8]) -> Self {
+        let mut steps = Vec::with_capacity(default_notes.len());
+        for &note in default_notes {
+            steps.push([StepData::off(note); STEPS]);
+        }
+        Self { steps }
+    }
+
+    /// Number of tracks in this pattern
+    pub fn num_tracks(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// Add a new track with the given default note
+    pub fn add_track(&mut self, default_note: u8) {
+        self.steps.push([StepData::off(default_note); STEPS]);
+    }
+
+    /// Remove the last track (if more than 1 remain)
+    pub fn remove_track(&mut self, index: usize) {
+        if self.steps.len() > 1 && index < self.steps.len() {
+            self.steps.remove(index);
+        }
+    }
+
     /// Toggle step active state. When activating, uses the step's existing note.
     pub fn toggle(&mut self, track: usize, step: usize) -> bool {
-        if track < TRACKS && step < STEPS {
+        if track < self.steps.len() && step < STEPS {
             self.steps[track][step].active = !self.steps[track][step].active;
             self.steps[track][step].active
         } else {
@@ -207,14 +220,14 @@ impl Pattern {
     }
 
     pub fn set(&mut self, track: usize, step: usize, value: bool) {
-        if track < TRACKS && step < STEPS {
+        if track < self.steps.len() && step < STEPS {
             self.steps[track][step].active = value;
         }
     }
 
     /// Backward-compatible: returns whether a step is active
     pub fn get(&self, track: usize, step: usize) -> bool {
-        if track < TRACKS && step < STEPS {
+        if track < self.steps.len() && step < STEPS {
             self.steps[track][step].active
         } else {
             false
@@ -223,7 +236,7 @@ impl Pattern {
 
     /// Get full step data (active + note)
     pub fn get_step(&self, track: usize, step: usize) -> StepData {
-        if track < TRACKS && step < STEPS {
+        if track < self.steps.len() && step < STEPS {
             self.steps[track][step]
         } else {
             StepData::off(60)
@@ -232,14 +245,14 @@ impl Pattern {
 
     /// Set the MIDI note for a step
     pub fn set_note(&mut self, track: usize, step: usize, note: u8) {
-        if track < TRACKS && step < STEPS {
+        if track < self.steps.len() && step < STEPS {
             self.steps[track][step].note = note.min(127);
         }
     }
 
     pub fn clear_track(&mut self, track: usize) {
-        if track < TRACKS {
-            let default_note = DEFAULT_NOTES[track];
+        if track < self.steps.len() {
+            let default_note = self.default_note_for_track(track);
             for step in 0..STEPS {
                 self.steps[track][step] = StepData::off(default_note);
             }
@@ -247,8 +260,8 @@ impl Pattern {
     }
 
     pub fn fill_track(&mut self, track: usize) {
-        if track < TRACKS {
-            let default_note = DEFAULT_NOTES[track];
+        if track < self.steps.len() {
+            let default_note = self.default_note_for_track(track);
             for step in 0..STEPS {
                 self.steps[track][step] = StepData::on(default_note);
             }
@@ -256,8 +269,17 @@ impl Pattern {
     }
 
     pub fn clear_all(&mut self) {
-        for track in 0..TRACKS {
+        for track in 0..self.steps.len() {
             self.clear_track(track);
+        }
+    }
+
+    /// Get the default note for a track (from first step or DEFAULT_NOTES)
+    fn default_note_for_track(&self, track: usize) -> u8 {
+        if track < DEFAULT_NOTES.len() {
+            DEFAULT_NOTES[track]
+        } else {
+            60 // C4
         }
     }
 }

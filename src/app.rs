@@ -24,10 +24,11 @@ use crate::project;
 use crate::project::renderer::{ExportMode, export_wav};
 use crate::sequencer::{PlaybackMode, NUM_PATTERNS};
 use crate::ui::{
-    get_param_value, render_fx, render_grid, render_mixer, render_params, render_song,
-    render_transport, FxEditorState, GridState, MixerField, MixerState, ParamEditorState,
-    SongState, Theme, TransportInfo,
+    get_param_descriptors, get_snapshot_param_value, render_fx, render_grid, render_help,
+    render_mixer, render_params, render_song, render_transport, FxEditorState, GridState,
+    HelpState, MixerField, MixerState, ParamEditorState, SongState, Theme, TransportInfo,
 };
+use crate::ui::help::help_line_count;
 
 /// Current UI view
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -37,6 +38,7 @@ pub enum View {
     Mixer,
     Fx,
     Song,
+    Help,
 }
 
 /// Application state
@@ -61,8 +63,12 @@ pub struct App {
     fx_editor: FxEditorState,
     /// Song/arrangement editor state
     song_state: SongState,
+    /// Help view state
+    help_state: HelpState,
     /// Current view
     view: View,
+    /// Previous view (for returning from Help)
+    prev_view: View,
     /// Whether the app should quit
     should_quit: bool,
     /// Shutdown flag for the MCP socket server
@@ -108,7 +114,9 @@ impl App {
             mixer_state: MixerState::new(),
             fx_editor: FxEditorState::new(),
             song_state: SongState::new(),
+            help_state: HelpState::new(),
             view: View::Grid,
+            prev_view: View::Grid,
             should_quit: false,
             mcp_shutdown,
             project_path: None,
@@ -199,6 +207,11 @@ impl App {
         self.status_message = Some((msg, Instant::now()));
     }
 
+    /// Get the current number of tracks
+    fn num_tracks(&self) -> usize {
+        self.sequencer_state.read().num_tracks()
+    }
+
     /// Handle key press events
     fn handle_key(&mut self, key: KeyEvent) {
         // Global Ctrl keybindings (checked before view-specific)
@@ -224,12 +237,20 @@ impl App {
             }
         }
 
+        // 'G' toggles Help from any view
+        if key.code == KeyCode::Char('g') && self.view != View::Help {
+            self.prev_view = self.view;
+            self.view = View::Help;
+            return;
+        }
+
         match self.view {
             View::Grid => self.handle_grid_key(key.code),
             View::Params => self.handle_params_key(key.code),
             View::Mixer => self.handle_mixer_key(key.code),
             View::Fx => self.handle_fx_key(key.code),
             View::Song => self.handle_song_key(key.code),
+            View::Help => self.handle_help_key(key.code),
         }
     }
 
@@ -300,6 +321,7 @@ impl App {
 
     /// Handle keys in grid view
     fn handle_grid_key(&mut self, key: KeyCode) {
+        let num_tracks = self.num_tracks();
         match key {
             // Quit
             KeyCode::Char('q') | KeyCode::Esc => {
@@ -310,7 +332,7 @@ impl App {
             KeyCode::Tab | KeyCode::Char('e') => {
                 self.view = View::Params;
                 // Sync param editor track with grid cursor
-                self.param_editor.switch_track(self.grid_state.cursor_track);
+                self.param_editor.switch_track(self.grid_state.cursor_track, num_tracks);
             }
 
             // Toggle step at cursor
@@ -339,16 +361,16 @@ impl App {
 
             // Navigation
             KeyCode::Left | KeyCode::Char('h') => {
-                self.grid_state.move_cursor(-1, 0);
+                self.grid_state.move_cursor(-1, 0, num_tracks);
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                self.grid_state.move_cursor(1, 0);
+                self.grid_state.move_cursor(1, 0, num_tracks);
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.grid_state.move_cursor(0, -1);
+                self.grid_state.move_cursor(0, -1, num_tracks);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.grid_state.move_cursor(0, 1);
+                self.grid_state.move_cursor(0, 1, num_tracks);
             }
 
             // BPM control
@@ -406,6 +428,12 @@ impl App {
 
     /// Handle keys in params view
     fn handle_params_key(&mut self, key: KeyCode) {
+        let num_tracks = self.num_tracks();
+        let param_count = {
+            let state = self.sequencer_state.read();
+            get_param_descriptors(&state, self.param_editor.track).len()
+        };
+
         match key {
             // Quit
             KeyCode::Char('q') => {
@@ -422,17 +450,17 @@ impl App {
 
             // Navigate params
             KeyCode::Up | KeyCode::Char('k') => {
-                self.param_editor.move_selection(-1);
+                self.param_editor.move_selection(-1, param_count);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.param_editor.move_selection(1);
+                self.param_editor.move_selection(1, param_count);
             }
 
-            // Switch track
-            KeyCode::Char('1') => self.param_editor.switch_track(0),
-            KeyCode::Char('2') => self.param_editor.switch_track(1),
-            KeyCode::Char('3') => self.param_editor.switch_track(2),
-            KeyCode::Char('4') => self.param_editor.switch_track(3),
+            // Switch track (1-9)
+            KeyCode::Char(c @ '1'..='9') => {
+                let track = (c as usize) - ('1' as usize);
+                self.param_editor.switch_track(track, num_tracks);
+            }
 
             // Adjust value (fine)
             KeyCode::Left | KeyCode::Char('h') => {
@@ -470,6 +498,7 @@ impl App {
 
     /// Handle keys in mixer view
     fn handle_mixer_key(&mut self, key: KeyCode) {
+        let num_tracks = self.num_tracks();
         match key {
             // Quit
             KeyCode::Char('q') => {
@@ -484,11 +513,11 @@ impl App {
                 self.view = View::Grid;
             }
 
-            // Select track
-            KeyCode::Char('1') => self.mixer_state.select_track(0),
-            KeyCode::Char('2') => self.mixer_state.select_track(1),
-            KeyCode::Char('3') => self.mixer_state.select_track(2),
-            KeyCode::Char('4') => self.mixer_state.select_track(3),
+            // Select track (1-9)
+            KeyCode::Char(c @ '1'..='9') => {
+                let track = (c as usize) - ('1' as usize);
+                self.mixer_state.select_track(track, num_tracks);
+            }
 
             // Navigate fields
             KeyCode::Up | KeyCode::Char('k') => {
@@ -535,6 +564,7 @@ impl App {
 
     /// Handle keys in FX view
     fn handle_fx_key(&mut self, key: KeyCode) {
+        let num_tracks = self.num_tracks();
         match key {
             // Quit
             KeyCode::Char('q') => {
@@ -549,12 +579,14 @@ impl App {
                 self.view = View::Grid;
             }
 
-            // Select track
-            KeyCode::Char('1') => self.fx_editor.select_track(0),
-            KeyCode::Char('2') => self.fx_editor.select_track(1),
-            KeyCode::Char('3') => self.fx_editor.select_track(2),
-            KeyCode::Char('4') => self.fx_editor.select_track(3),
-            KeyCode::Char('5') | KeyCode::Char('m') => self.fx_editor.select_track(4),
+            // Select track (1-9) or master (m)
+            KeyCode::Char(c @ '1'..='9') => {
+                let track = (c as usize) - ('1' as usize);
+                self.fx_editor.select_track(track, num_tracks);
+            }
+            KeyCode::Char('m') => {
+                self.fx_editor.select_track(num_tracks, num_tracks);
+            }
 
             // Navigate params
             KeyCode::Up | KeyCode::Char('k') => {
@@ -795,9 +827,31 @@ impl App {
         }
     }
 
+    /// Handle keys in help view
+    fn handle_help_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc | KeyCode::Char('g') | KeyCode::Tab => {
+                self.view = self.prev_view;
+            }
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.help_state.scroll_up();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let total = help_line_count(&self.theme);
+                // Rough estimate of visible lines
+                self.help_state.scroll_down(total, 20);
+            }
+            _ => {}
+        }
+    }
+
     /// Toggle the FX effect that the cursor is currently in
     fn toggle_current_fx(&mut self) {
-        if self.fx_editor.track == 4 {
+        let num_tracks = self.num_tracks();
+        if self.fx_editor.is_master(num_tracks) {
             // Master: toggle reverb
             self.dispatch(Command::ToggleMasterFxEnabled);
         } else {
@@ -815,7 +869,8 @@ impl App {
 
     /// Adjust the currently selected FX parameter
     fn adjust_fx_param(&mut self, delta_normalized: f32) {
-        if self.fx_editor.track == 4 {
+        let num_tracks = self.num_tracks();
+        if self.fx_editor.is_master(num_tracks) {
             // Master FX
             let params = MasterFxParamId::all();
             if self.fx_editor.param_index >= params.len() {
@@ -839,15 +894,17 @@ impl App {
             // Filter type is special: cycle through LP/HP/BP
             if section == 0 && local_idx == 0 {
                 let state = self.sequencer_state.read();
-                let current_type = state.track_fx[track].filter_type;
-                drop(state);
-                let dir = if delta_normalized > 0.0 { 1i32 } else { -1i32 };
-                let new_idx = (current_type.index() as i32 + dir).rem_euclid(3) as usize;
-                let new_type = FilterType::from_index(new_idx);
-                self.dispatch(Command::SetFxFilterType {
-                    track,
-                    filter_type: new_type,
-                });
+                if track < state.tracks.len() {
+                    let current_type = state.tracks[track].fx.filter_type;
+                    drop(state);
+                    let dir = if delta_normalized > 0.0 { 1i32 } else { -1i32 };
+                    let new_idx = (current_type.index() as i32 + dir).rem_euclid(3) as usize;
+                    let new_type = FilterType::from_index(new_idx);
+                    self.dispatch(Command::SetFxFilterType {
+                        track,
+                        filter_type: new_type,
+                    });
+                }
                 return;
             }
 
@@ -881,9 +938,14 @@ impl App {
     /// Adjust a mixer value based on current field selection
     fn adjust_mixer_value(&mut self, direction: i32) {
         let track = self.mixer_state.selected_track;
+        let state = self.sequencer_state.read();
+        if track >= state.tracks.len() {
+            return;
+        }
         match self.mixer_state.selected_field {
             MixerField::Volume => {
-                let current = self.sequencer_state.read().track_volumes[track];
+                let current = state.tracks[track].volume;
+                drop(state);
                 let new_vol = (current + direction as f32 * 0.05).clamp(0.0, 1.0);
                 self.dispatch(Command::SetTrackVolume {
                     track,
@@ -891,7 +953,8 @@ impl App {
                 });
             }
             MixerField::Pan => {
-                let current = self.sequencer_state.read().track_pans[track];
+                let current = state.tracks[track].pan;
+                drop(state);
                 let new_pan = (current + direction as f32 * 0.1).clamp(-1.0, 1.0);
                 self.dispatch(Command::SetTrackPan {
                     track,
@@ -899,9 +962,11 @@ impl App {
                 });
             }
             MixerField::Mute => {
+                drop(state);
                 self.dispatch(Command::ToggleMute(track));
             }
             MixerField::Solo => {
+                drop(state);
                 self.dispatch(Command::ToggleSolo(track));
             }
         }
@@ -928,21 +993,27 @@ impl App {
         });
     }
 
-    /// Adjust the currently selected parameter
+    /// Adjust the currently selected parameter (uses string-key system)
     fn adjust_current_param(&mut self, delta_normalized: f32) {
-        let Some(param) = self.param_editor.current_param() else {
-            return;
-        };
+        let track = self.param_editor.track;
+        let idx = self.param_editor.param_index;
 
-        let (min, max, _default) = param.range();
         let state = self.sequencer_state.read();
-        let current = get_param_value(&state, param);
+        let descriptors = get_param_descriptors(&state, track);
+        if idx >= descriptors.len() {
+            return;
+        }
+
+        let desc = &descriptors[idx];
+        let current = get_snapshot_param_value(&state, track, &desc.key);
         drop(state);
 
-        let new_value = (current + delta_normalized * (max - min)).clamp(min, max);
+        let range = desc.max - desc.min;
+        let new_value = (current + delta_normalized * range).clamp(desc.min, desc.max);
 
-        self.dispatch(Command::SetParam {
-            param,
+        self.dispatch(Command::SetTrackParam {
+            track,
+            key: desc.key.clone(),
             value: new_value,
         });
     }
@@ -1003,6 +1074,7 @@ impl App {
         // Render main content based on view
         match self.view {
             View::Grid => {
+                let track_names: Vec<String> = state.tracks.iter().map(|t| t.name.clone()).collect();
                 render_grid(
                     frame,
                     chunks[2],
@@ -1010,6 +1082,7 @@ impl App {
                     &self.grid_state,
                     state.current_step,
                     state.playing,
+                    &track_names,
                     &self.theme,
                 );
             }
@@ -1025,6 +1098,10 @@ impl App {
             View::Song => {
                 render_song(frame, chunks[2], &state, &self.song_state, &self.theme);
             }
+            View::Help => {
+                drop(state);
+                render_help(frame, chunks[2], &self.help_state, &self.theme);
+            }
         }
 
         self.render_footer(frame, chunks[3]);
@@ -1038,6 +1115,7 @@ impl App {
             View::Mixer => "[MIXER]",
             View::Fx => "[FX]",
             View::Song => "[SONG]",
+            View::Help => "[HELP]",
         };
         let title = format!(
             " GRIDOXIDE v{} {} ",
@@ -1089,23 +1167,27 @@ impl App {
     fn footer_help(&self) -> String {
         match self.view {
             View::Grid => format!(
-                "SPACE:Toggle | [/]:Note | ,/.:Pattern | P:Play | S:Stop | C-s:Save | C-o:Load | C-e:Export | TAB:Params | Q:Quit | {}",
+                "SPACE:Toggle | [/]:Note | ,/.:Pattern | P:Play | S:Stop | C-s:Save | C-o:Load | G:Help | TAB:Params | Q:Quit | {}",
                 self.theme.name
             ),
             View::Params => format!(
-                "1-4:Track | Up/Down:Select | Left/Right:Adjust | [/]:Coarse | C-s:Save | TAB:Mixer | Q:Quit | {}",
+                "1-9:Track | Up/Down:Select | Left/Right:Adjust | [/]:Coarse | C-s:Save | G:Help | TAB:Mixer | Q:Quit | {}",
                 self.theme.name
             ),
             View::Mixer => format!(
-                "1-4:Track | Up/Down:Field | Left/Right:Adjust | M:Mute | O:Solo | C-s:Save | TAB:FX | Q:Quit | {}",
+                "1-9:Track | Up/Down:Field | Left/Right:Adjust | M:Mute | O:Solo | C-s:Save | G:Help | TAB:FX | Q:Quit | {}",
                 self.theme.name
             ),
             View::Fx => format!(
-                "1-5:Track/Master | Up/Down:Select | Left/Right:Adjust | SPACE:Toggle FX | C-s:Save | TAB:Song | Q:Quit | {}",
+                "1-9:Track | M:Master | Up/Down:Select | Left/Right:Adjust | SPACE:Toggle FX | G:Help | TAB:Song | Q:Quit | {}",
                 self.theme.name
             ),
             View::Song => format!(
-                "Up/Down:Move | Left/Right:Repeats | +/-:Pattern | A:Add | D:Delete | M:Mode | P:Play | C-s:Save | C-w:Export Song | TAB:Grid | Q:Quit | {}",
+                "Up/Down:Move | Left/Right:Repeats | +/-:Pattern | A:Add | D:Delete | M:Mode | G:Help | TAB:Grid | Q:Quit | {}",
+                self.theme.name
+            ),
+            View::Help => format!(
+                "Up/Down:Scroll | G/Esc/Tab:Back | Q:Quit | {}",
                 self.theme.name
             ),
         }

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::audio::SequencerState;
 use crate::fx::{FilterType, FxParamId, FxType, MasterFxParamId};
 use crate::sequencer::PlaybackMode;
-use crate::synth::{BassParams, HiHatParams, KickParams, ParamId, SnareParams};
+use crate::synth::SynthType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandSource {
@@ -24,17 +24,15 @@ pub enum Command {
     ClearTrack(usize),
     FillTrack(usize),
 
-    // Track parameters
-    SetKickParams(KickParams),
-    SetSnareParams(SnareParams),
-    SetHiHatParams(HiHatParams),
-    SetBassParams(BassParams),
-
     // Per-step note
     SetStepNote { track: usize, step: usize, note: u8 },
 
-    // Single parameter adjustment
-    SetParam { param: ParamId, value: f32 },
+    // Dynamic track parameter (replaces old SetKickParams/SetSnareParams/etc.)
+    SetTrackParam { track: usize, key: String, value: f32 },
+
+    // Dynamic track management
+    AddTrack { synth_type: SynthType, name: String },
+    RemoveTrack(usize),
 
     // Mixer
     SetTrackVolume { track: usize, volume: f32 },
@@ -92,13 +90,13 @@ impl Command {
             Command::SetStepNote { track, step, note } => {
                 format!("Set track {} step {} note to {}", track, step, note)
             }
-            Command::SetKickParams(_) => "Set kick parameters".to_string(),
-            Command::SetSnareParams(_) => "Set snare parameters".to_string(),
-            Command::SetHiHatParams(_) => "Set hi-hat parameters".to_string(),
-            Command::SetBassParams(_) => "Set bass parameters".to_string(),
-            Command::SetParam { param, value } => {
-                format!("Set {} to {:.2}", param.name(), value)
+            Command::SetTrackParam { track, key, value } => {
+                format!("Set track {} param {} to {:.2}", track, key, value)
             }
+            Command::AddTrack { synth_type, name } => {
+                format!("Add {} track '{}'", synth_type.name(), name)
+            }
+            Command::RemoveTrack(track) => format!("Remove track {}", track),
             Command::SetTrackVolume { track, volume } => {
                 format!("Set track {} volume to {:.2}", track, volume)
             }

@@ -10,9 +10,8 @@ use crate::event::EventLog;
 use crate::fx::{FilterType, FxParamId, FxType, MasterFxParamId};
 use crate::project;
 use crate::project::renderer::{ExportMode, export_wav};
-use crate::sequencer::{PlaybackMode, TrackType, NUM_PATTERNS};
-use crate::synth::{note_name, BassParams, HiHatParams, KickParams, ParamId, SnareParams, DEFAULT_NOTES};
-use crate::ui::get_param_value;
+use crate::sequencer::{PlaybackMode, NUM_PATTERNS};
+use crate::synth::{create_synth, note_name, ParamDescriptor, SynthType};
 
 /// MCP server handler for gridoxide
 pub struct GridoxideMcp {
@@ -40,34 +39,64 @@ impl GridoxideMcp {
         self.command_sender.send(cmd, CommandSource::Mcp);
     }
 
+    /// Get the current number of tracks
+    fn num_tracks(&self) -> usize {
+        self.sequencer_state.read().num_tracks()
+    }
+
+    /// Validate track index, returning error JSON if out of range
+    fn validate_track(&self, track: usize) -> Option<Value> {
+        let n = self.num_tracks();
+        if track >= n {
+            Some(json!({ "status": "error", "message": format!("Track must be 0-{}", n - 1) }))
+        } else {
+            None
+        }
+    }
+
+    /// Get track name from state
+    fn track_name(&self, track: usize) -> String {
+        let state = self.sequencer_state.read();
+        if track < state.tracks.len() {
+            state.tracks[track].name.clone()
+        } else {
+            format!("track{}", track)
+        }
+    }
+
+    /// Get param descriptors for a track
+    fn get_param_descriptors(&self, track: usize) -> Vec<ParamDescriptor> {
+        let state = self.sequencer_state.read();
+        if track >= state.tracks.len() {
+            return vec![];
+        }
+        let synth = create_synth(state.tracks[track].synth_type, 44100.0, None);
+        synth.param_descriptors()
+    }
+
     // === Transport Tools ===
 
-    /// Start playback
     pub fn play(&self) -> Value {
         self.dispatch(Command::Play);
         json!({ "status": "ok", "message": "Playback started" })
     }
 
-    /// Pause playback (keep position)
     pub fn pause(&self) -> Value {
         self.dispatch(Command::Pause);
         json!({ "status": "ok", "message": "Playback paused" })
     }
 
-    /// Stop playback and reset to step 0
     pub fn stop(&self) -> Value {
         self.dispatch(Command::Stop);
         json!({ "status": "ok", "message": "Playback stopped" })
     }
 
-    /// Set the tempo in BPM (60-200)
     pub fn set_bpm(&self, bpm: f32) -> Value {
         let bpm = bpm.clamp(60.0, 200.0);
         self.dispatch(Command::SetBpm(bpm));
         json!({ "status": "ok", "bpm": bpm })
     }
 
-    /// Get current transport state
     pub fn get_state(&self) -> Value {
         let state = self.sequencer_state.read();
         let mode_str = match state.playback_mode {
@@ -81,22 +110,21 @@ impl GridoxideMcp {
             "current_pattern": state.current_pattern,
             "playback_mode": mode_str,
             "arrangement_position": state.arrangement_position,
-            "arrangement_repeat": state.arrangement_repeat
+            "arrangement_repeat": state.arrangement_repeat,
+            "num_tracks": state.tracks.len()
         })
     }
 
     // === Pattern Tools ===
 
-    /// Toggle a step on/off (track: 0-3, step: 0-15), optionally setting a note
     pub fn toggle_step(&self, track: usize, step: usize, note: Option<u8>) -> Value {
-        if track >= 4 {
-            return json!({ "status": "error", "message": "Track must be 0-3" });
+        if let Some(err) = self.validate_track(track) {
+            return err;
         }
         if step >= 16 {
             return json!({ "status": "error", "message": "Step must be 0-15" });
         }
 
-        // If a note is provided, set it before toggling
         if let Some(n) = note {
             let clamped = n.min(127);
             self.dispatch(Command::SetStepNote { track, step, note: clamped });
@@ -104,10 +132,7 @@ impl GridoxideMcp {
 
         self.dispatch(Command::ToggleStep { track, step });
 
-        let track_name = TrackType::from_index(track)
-            .map(|t| t.name())
-            .unwrap_or("unknown");
-
+        let track_name = self.track_name(track);
         json!({
             "status": "ok",
             "track": track,
@@ -116,7 +141,6 @@ impl GridoxideMcp {
         })
     }
 
-    /// Get the full pattern grid (including note data). If pattern_index is Some, read from bank.
     pub fn get_pattern(&self, pattern_index: Option<usize>) -> Value {
         let state = self.sequencer_state.read();
         let pat = match pattern_index {
@@ -124,10 +148,20 @@ impl GridoxideMcp {
             _ => &state.pattern,
         };
         let display_idx = pattern_index.unwrap_or(state.current_pattern);
+        let num_tracks = pat.num_tracks();
 
-        let tracks: Vec<Value> = (0..4)
+        let tracks: Vec<Value> = (0..num_tracks)
             .map(|track| {
-                let track_type = TrackType::from_index(track).unwrap();
+                let name = if track < state.tracks.len() {
+                    state.tracks[track].name.clone()
+                } else {
+                    format!("track{}", track)
+                };
+                let default_note = if track < state.tracks.len() {
+                    state.tracks[track].default_note
+                } else {
+                    60
+                };
                 let steps: Vec<bool> = (0..16).map(|step| pat.get(track, step)).collect();
                 let notes: Vec<Value> = (0..16)
                     .map(|step| {
@@ -140,10 +174,10 @@ impl GridoxideMcp {
                     .collect();
                 json!({
                     "track": track,
-                    "name": track_type.name(),
+                    "name": name,
                     "steps": steps,
                     "notes": notes,
-                    "default_note": DEFAULT_NOTES[track]
+                    "default_note": default_note
                 })
             })
             .collect();
@@ -154,22 +188,17 @@ impl GridoxideMcp {
         })
     }
 
-    /// Set the MIDI note for a specific step
     pub fn set_step_note(&self, track: usize, step: usize, note: u8) -> Value {
-        if track >= 4 {
-            return json!({ "status": "error", "message": "Track must be 0-3" });
+        if let Some(err) = self.validate_track(track) {
+            return err;
         }
         if step >= 16 {
             return json!({ "status": "error", "message": "Step must be 0-15" });
         }
         let clamped = note.min(127);
-
         self.dispatch(Command::SetStepNote { track, step, note: clamped });
 
-        let track_name = TrackType::from_index(track)
-            .map(|t| t.name())
-            .unwrap_or("unknown");
-
+        let track_name = self.track_name(track);
         json!({
             "status": "ok",
             "track": track,
@@ -180,14 +209,14 @@ impl GridoxideMcp {
         })
     }
 
-    /// Get all step data for a track including notes
     pub fn get_step_notes(&self, track: usize) -> Value {
-        if track >= 4 {
-            return json!({ "status": "error", "message": "Track must be 0-3" });
+        if let Some(err) = self.validate_track(track) {
+            return err;
         }
 
         let state = self.sequencer_state.read();
-        let track_type = TrackType::from_index(track).unwrap();
+        let track_name = state.tracks[track].name.clone();
+        let default_note = state.tracks[track].default_note;
         let steps: Vec<Value> = (0..16)
             .map(|step| {
                 let sd = state.pattern.get_step(track, step);
@@ -202,24 +231,18 @@ impl GridoxideMcp {
 
         json!({
             "track": track,
-            "name": track_type.name(),
-            "default_note": DEFAULT_NOTES[track],
+            "name": track_name,
+            "default_note": default_note,
             "steps": steps
         })
     }
 
-    /// Clear all steps on a track
     pub fn clear_track(&self, track: usize) -> Value {
-        if track >= 4 {
-            return json!({ "status": "error", "message": "Track must be 0-3" });
+        if let Some(err) = self.validate_track(track) {
+            return err;
         }
-
         self.dispatch(Command::ClearTrack(track));
-
-        let track_name = TrackType::from_index(track)
-            .map(|t| t.name())
-            .unwrap_or("unknown");
-
+        let track_name = self.track_name(track);
         json!({
             "status": "ok",
             "track": track,
@@ -228,18 +251,12 @@ impl GridoxideMcp {
         })
     }
 
-    /// Fill all steps on a track
     pub fn fill_track(&self, track: usize) -> Value {
-        if track >= 4 {
-            return json!({ "status": "error", "message": "Track must be 0-3" });
+        if let Some(err) = self.validate_track(track) {
+            return err;
         }
-
         self.dispatch(Command::FillTrack(track));
-
-        let track_name = TrackType::from_index(track)
-            .map(|t| t.name())
-            .unwrap_or("unknown");
-
+        let track_name = self.track_name(track);
         json!({
             "status": "ok",
             "track": track,
@@ -250,7 +267,6 @@ impl GridoxideMcp {
 
     // === Event Query ===
 
-    /// Get events since a given ID (for "listening" to human actions)
     pub fn get_events(&self, since_id: u64) -> Value {
         let log = self.event_log.read();
         let events = log.get_events_since(since_id);
@@ -262,18 +278,22 @@ impl GridoxideMcp {
 
     // === Track Parameter Tools ===
 
-    /// List all tracks with their synth types and parameter names
     pub fn list_tracks(&self) -> Value {
-        let tracks: Vec<Value> = (0..4)
-            .map(|track| {
-                let track_type = TrackType::from_index(track).unwrap();
-                let params = ParamId::params_for_track(track);
-                let param_names: Vec<&str> = params.iter().map(|p| p.name()).collect();
-                let param_keys: Vec<&str> = params.iter().map(|p| p.key()).collect();
+        let state = self.sequencer_state.read();
+        let tracks: Vec<Value> = state
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, track)| {
+                let synth = create_synth(track.synth_type, 44100.0, None);
+                let descriptors = synth.param_descriptors();
+                let param_keys: Vec<&str> = descriptors.iter().map(|d| d.key.as_str()).collect();
+                let param_names: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
 
                 json!({
-                    "track": track,
-                    "name": track_type.name(),
+                    "track": i,
+                    "name": track.name,
+                    "synth_type": track.synth_type.name(),
                     "params": param_keys,
                     "param_names": param_names
                 })
@@ -283,124 +303,254 @@ impl GridoxideMcp {
         json!({ "tracks": tracks })
     }
 
-    /// Get all parameters for a specific track
     pub fn get_track_params(&self, track: usize) -> Value {
-        if track >= 4 {
-            return json!({ "status": "error", "message": "Track must be 0-3" });
+        if let Some(err) = self.validate_track(track) {
+            return err;
         }
 
         let state = self.sequencer_state.read();
-        let track_type = TrackType::from_index(track).unwrap();
-        let params = ParamId::params_for_track(track);
+        let track_state = &state.tracks[track];
+        let synth = create_synth(track_state.synth_type, 44100.0, None);
+        let descriptors = synth.param_descriptors();
 
-        let param_values: Vec<Value> = params
+        let param_values: Vec<Value> = descriptors
             .iter()
-            .map(|p| {
-                let value = get_param_value(&state, *p);
-                let (min, max, default) = p.range();
+            .map(|desc| {
+                let value = track_state
+                    .params_snapshot
+                    .get(&desc.key)
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(desc.default as f64) as f32;
                 json!({
-                    "key": p.key(),
-                    "name": p.name(),
+                    "key": desc.key,
+                    "name": desc.name,
                     "value": value,
-                    "min": min,
-                    "max": max,
-                    "default": default
+                    "min": desc.min,
+                    "max": desc.max,
+                    "default": desc.default
                 })
             })
             .collect();
 
         json!({
             "track": track,
-            "name": track_type.name(),
+            "name": track_state.name,
+            "synth_type": track_state.synth_type.name(),
             "params": param_values
         })
     }
 
-    /// Set a single parameter by key
+    /// Set a single parameter by key. Supports both old-style prefixed keys
+    /// (e.g. "kick_pitch_start") and new (track, key) style via set_track_param.
     pub fn set_param(&self, param_key: &str, value: f32) -> Value {
-        let param = match ParamId::from_key(param_key) {
-            Some(p) => p,
-            None => {
-                return json!({
-                    "status": "error",
-                    "message": format!("Unknown parameter: {}", param_key)
-                })
+        // Try to find which track this param belongs to by checking each track's descriptors
+        let state = self.sequencer_state.read();
+        for (i, track) in state.tracks.iter().enumerate() {
+            let synth = create_synth(track.synth_type, 44100.0, None);
+            let descriptors = synth.param_descriptors();
+
+            // Check if param_key matches a descriptor key directly
+            for desc in &descriptors {
+                if desc.key == param_key {
+                    let clamped = value.clamp(desc.min, desc.max);
+                    drop(state);
+                    self.dispatch(Command::SetTrackParam {
+                        track: i,
+                        key: param_key.to_string(),
+                        value: clamped,
+                    });
+                    return json!({
+                        "status": "ok",
+                        "track": i,
+                        "param": param_key,
+                        "name": desc.name,
+                        "value": clamped,
+                        "min": desc.min,
+                        "max": desc.max
+                    });
+                }
             }
-        };
 
-        let (min, max, _default) = param.range();
-        let clamped_value = value.clamp(min, max);
-
-        self.dispatch(Command::SetParam {
-            param,
-            value: clamped_value,
-        });
+            // Check old-style prefixed keys (e.g., "kick_pitch_start" -> track 0, key "pitch_start")
+            let prefix = format!("{}_", track.synth_type.name().to_lowercase());
+            if param_key.starts_with(&prefix) {
+                let short_key = &param_key[prefix.len()..];
+                for desc in &descriptors {
+                    if desc.key == short_key {
+                        let clamped = value.clamp(desc.min, desc.max);
+                        drop(state);
+                        self.dispatch(Command::SetTrackParam {
+                            track: i,
+                            key: short_key.to_string(),
+                            value: clamped,
+                        });
+                        return json!({
+                            "status": "ok",
+                            "track": i,
+                            "param": param_key,
+                            "name": desc.name,
+                            "value": clamped,
+                            "min": desc.min,
+                            "max": desc.max
+                        });
+                    }
+                }
+            }
+        }
+        drop(state);
 
         json!({
-            "status": "ok",
-            "param": param_key,
-            "name": param.name(),
-            "value": clamped_value,
-            "min": min,
-            "max": max
+            "status": "error",
+            "message": format!("Unknown parameter: {}. Use list_tracks or get_track_params to see available keys.", param_key)
+        })
+    }
+
+    /// Set a parameter on a specific track by key
+    pub fn set_track_param(&self, track: usize, key: &str, value: f32) -> Value {
+        if let Some(err) = self.validate_track(track) {
+            return err;
+        }
+
+        let descriptors = self.get_param_descriptors(track);
+        for desc in &descriptors {
+            if desc.key == key {
+                let clamped = value.clamp(desc.min, desc.max);
+                self.dispatch(Command::SetTrackParam {
+                    track,
+                    key: key.to_string(),
+                    value: clamped,
+                });
+                return json!({
+                    "status": "ok",
+                    "track": track,
+                    "param": key,
+                    "name": desc.name,
+                    "value": clamped,
+                    "min": desc.min,
+                    "max": desc.max
+                });
+            }
+        }
+
+        json!({
+            "status": "error",
+            "message": format!("Unknown parameter '{}' for track {}. Use get_track_params to see available keys.", key, track)
         })
     }
 
     /// Reset a track to default parameters
     pub fn reset_track(&self, track: usize) -> Value {
-        if track >= 4 {
-            return json!({ "status": "error", "message": "Track must be 0-3" });
+        if let Some(err) = self.validate_track(track) {
+            return err;
         }
 
-        let track_type = TrackType::from_index(track).unwrap();
+        // Create a default synth and get its default param values
+        let state = self.sequencer_state.read();
+        let synth_type = state.tracks[track].synth_type;
+        let track_name = state.tracks[track].name.clone();
+        drop(state);
 
-        match track {
-            0 => self.dispatch(Command::SetKickParams(KickParams::default())),
-            1 => self.dispatch(Command::SetSnareParams(SnareParams::default())),
-            2 => self.dispatch(Command::SetHiHatParams(HiHatParams::default())),
-            3 => self.dispatch(Command::SetBassParams(BassParams::default())),
-            _ => unreachable!(),
+        let default_synth = create_synth(synth_type, 44100.0, None);
+        let descriptors = default_synth.param_descriptors();
+        for desc in &descriptors {
+            self.dispatch(Command::SetTrackParam {
+                track,
+                key: desc.key.clone(),
+                value: desc.default,
+            });
         }
 
         json!({
             "status": "ok",
             "track": track,
-            "name": track_type.name(),
-            "message": format!("Reset {} to default parameters", track_type.name())
+            "name": track_name,
+            "message": format!("Reset {} to default parameters", track_name)
+        })
+    }
+
+    /// Add a new track
+    pub fn add_track(&self, synth_type_str: &str, name: &str) -> Value {
+        let synth_type = match SynthType::from_name(synth_type_str) {
+            Some(st) => st,
+            None => {
+                return json!({
+                    "status": "error",
+                    "message": format!("Unknown synth type: '{}'. Valid: kick, snare, hihat, bass", synth_type_str)
+                });
+            }
+        };
+
+        let playing = self.sequencer_state.read().playing;
+        if playing {
+            return json!({ "status": "error", "message": "Cannot add track while playing. Stop playback first." });
+        }
+
+        self.dispatch(Command::AddTrack {
+            synth_type,
+            name: name.to_string(),
+        });
+
+        json!({
+            "status": "ok",
+            "message": format!("Added {} track '{}'", synth_type.name(), name),
+            "num_tracks": self.num_tracks()
+        })
+    }
+
+    /// Remove a track
+    pub fn remove_track(&self, track: usize) -> Value {
+        if let Some(err) = self.validate_track(track) {
+            return err;
+        }
+
+        let state = self.sequencer_state.read();
+        if state.tracks.len() <= 1 {
+            return json!({ "status": "error", "message": "Cannot remove the last track" });
+        }
+        if state.playing {
+            return json!({ "status": "error", "message": "Cannot remove track while playing. Stop playback first." });
+        }
+        let track_name = state.tracks[track].name.clone();
+        drop(state);
+
+        self.dispatch(Command::RemoveTrack(track));
+
+        json!({
+            "status": "ok",
+            "message": format!("Removed track {} ({})", track, track_name),
+            "num_tracks": self.num_tracks()
         })
     }
 
     // === Mixer Tools ===
 
-    /// Get all mixer state
     pub fn get_mixer(&self) -> Value {
         let state = self.sequencer_state.read();
-        let track_names = ["kick", "snare", "hihat", "bass"];
-        let tracks: Vec<Value> = (0..4)
-            .map(|i| {
+        let tracks: Vec<Value> = state
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
                 json!({
                     "track": i,
-                    "name": track_names[i],
-                    "volume": state.track_volumes[i],
-                    "pan": state.track_pans[i],
-                    "mute": state.track_mutes[i],
-                    "solo": state.track_solos[i]
+                    "name": t.name,
+                    "volume": t.volume,
+                    "pan": t.pan,
+                    "mute": t.mute,
+                    "solo": t.solo
                 })
             })
             .collect();
         json!({ "tracks": tracks })
     }
 
-    /// Set track volume (0.0-1.0)
     pub fn set_volume(&self, track: usize, volume: f32) -> Value {
-        if track >= 4 {
-            return json!({ "status": "error", "message": "Track must be 0-3" });
+        if let Some(err) = self.validate_track(track) {
+            return err;
         }
         let volume = volume.clamp(0.0, 1.0);
         self.dispatch(Command::SetTrackVolume { track, volume });
-        let track_name = TrackType::from_index(track)
-            .map(|t| t.name())
-            .unwrap_or("unknown");
+        let track_name = self.track_name(track);
         json!({
             "status": "ok",
             "track": track,
@@ -409,16 +559,13 @@ impl GridoxideMcp {
         })
     }
 
-    /// Set track pan (-1.0 to 1.0)
     pub fn set_pan(&self, track: usize, pan: f32) -> Value {
-        if track >= 4 {
-            return json!({ "status": "error", "message": "Track must be 0-3" });
+        if let Some(err) = self.validate_track(track) {
+            return err;
         }
         let pan = pan.clamp(-1.0, 1.0);
         self.dispatch(Command::SetTrackPan { track, pan });
-        let track_name = TrackType::from_index(track)
-            .map(|t| t.name())
-            .unwrap_or("unknown");
+        let track_name = self.track_name(track);
         json!({
             "status": "ok",
             "track": track,
@@ -427,15 +574,12 @@ impl GridoxideMcp {
         })
     }
 
-    /// Toggle track mute
     pub fn toggle_mute(&self, track: usize) -> Value {
-        if track >= 4 {
-            return json!({ "status": "error", "message": "Track must be 0-3" });
+        if let Some(err) = self.validate_track(track) {
+            return err;
         }
         self.dispatch(Command::ToggleMute(track));
-        let track_name = TrackType::from_index(track)
-            .map(|t| t.name())
-            .unwrap_or("unknown");
+        let track_name = self.track_name(track);
         json!({
             "status": "ok",
             "track": track,
@@ -444,15 +588,12 @@ impl GridoxideMcp {
         })
     }
 
-    /// Toggle track solo
     pub fn toggle_solo(&self, track: usize) -> Value {
-        if track >= 4 {
-            return json!({ "status": "error", "message": "Track must be 0-3" });
+        if let Some(err) = self.validate_track(track) {
+            return err;
         }
         self.dispatch(Command::ToggleSolo(track));
-        let track_name = TrackType::from_index(track)
-            .map(|t| t.name())
-            .unwrap_or("unknown");
+        let track_name = self.track_name(track);
         json!({
             "status": "ok",
             "track": track,
@@ -463,17 +604,14 @@ impl GridoxideMcp {
 
     // === FX Tools ===
 
-    /// Get all FX parameters for a track
     pub fn get_fx_params(&self, track: usize) -> Value {
-        if track >= 4 {
-            return json!({ "status": "error", "message": "Track must be 0-3" });
+        if let Some(err) = self.validate_track(track) {
+            return err;
         }
 
         let state = self.sequencer_state.read();
-        let track_name = TrackType::from_index(track)
-            .map(|t| t.name())
-            .unwrap_or("unknown");
-        let fx = &state.track_fx[track];
+        let track_name = state.tracks[track].name.clone();
+        let fx = &state.tracks[track].fx;
 
         json!({
             "track": track,
@@ -505,13 +643,11 @@ impl GridoxideMcp {
         })
     }
 
-    /// Set a per-track FX parameter
     pub fn set_fx_param(&self, track: usize, param_key: &str, value: f32) -> Value {
-        if track >= 4 {
-            return json!({ "status": "error", "message": "Track must be 0-3" });
+        if let Some(err) = self.validate_track(track) {
+            return err;
         }
 
-        // Handle filter type specially
         if param_key == "filter_type" {
             let ft = match value as usize {
                 0 => FilterType::LowPass,
@@ -554,10 +690,9 @@ impl GridoxideMcp {
         })
     }
 
-    /// Toggle a per-track FX on/off
     pub fn toggle_fx(&self, track: usize, fx_name: &str) -> Value {
-        if track >= 4 {
-            return json!({ "status": "error", "message": "Track must be 0-3" });
+        if let Some(err) = self.validate_track(track) {
+            return err;
         }
 
         let fx = match fx_name {
@@ -574,10 +709,7 @@ impl GridoxideMcp {
 
         self.dispatch(Command::ToggleFxEnabled { track, fx });
 
-        let track_name = TrackType::from_index(track)
-            .map(|t| t.name())
-            .unwrap_or("unknown");
-
+        let track_name = self.track_name(track);
         json!({
             "status": "ok",
             "track": track,
@@ -587,7 +719,6 @@ impl GridoxideMcp {
         })
     }
 
-    /// Get master FX (reverb) parameters
     pub fn get_master_fx_params(&self) -> Value {
         let state = self.sequencer_state.read();
         let mfx = &state.master_fx;
@@ -605,7 +736,6 @@ impl GridoxideMcp {
         })
     }
 
-    /// Set a master FX parameter
     pub fn set_master_fx_param(&self, param_key: &str, value: f32) -> Value {
         let param = match MasterFxParamId::from_key(param_key) {
             Some(p) => p,
@@ -632,7 +762,6 @@ impl GridoxideMcp {
         })
     }
 
-    /// Toggle master reverb on/off
     pub fn toggle_master_fx(&self) -> Value {
         self.dispatch(Command::ToggleMasterFxEnabled);
         json!({
@@ -643,7 +772,6 @@ impl GridoxideMcp {
 
     // === Pattern Bank Tools ===
 
-    /// Select active pattern (0-15)
     pub fn select_pattern(&self, pattern: usize) -> Value {
         if pattern >= NUM_PATTERNS {
             return json!({ "status": "error", "message": "Pattern must be 0-15" });
@@ -656,13 +784,13 @@ impl GridoxideMcp {
         })
     }
 
-    /// Get overview of all 16 patterns
     pub fn get_pattern_bank(&self) -> Value {
         let state = self.sequencer_state.read();
+        let num_tracks = state.tracks.len();
         let patterns: Vec<Value> = (0..NUM_PATTERNS)
             .map(|i| {
                 let has_content = state.pattern_bank.has_content(i);
-                let active_steps: usize = (0..4)
+                let active_steps: usize = (0..num_tracks)
                     .map(|t| (0..16).filter(|&s| state.pattern_bank.get(i).get(t, s)).count())
                     .sum();
                 json!({
@@ -680,7 +808,6 @@ impl GridoxideMcp {
         })
     }
 
-    /// Copy pattern from src to dst
     pub fn copy_pattern(&self, src: usize, dst: usize) -> Value {
         if src >= NUM_PATTERNS || dst >= NUM_PATTERNS {
             return json!({ "status": "error", "message": "Pattern indices must be 0-15" });
@@ -692,7 +819,6 @@ impl GridoxideMcp {
         })
     }
 
-    /// Clear a pattern slot
     pub fn clear_pattern(&self, pattern: usize) -> Value {
         if pattern >= NUM_PATTERNS {
             return json!({ "status": "error", "message": "Pattern must be 0-15" });
@@ -704,7 +830,6 @@ impl GridoxideMcp {
         })
     }
 
-    /// Set playback mode
     pub fn set_playback_mode(&self, mode: &str) -> Value {
         let playback_mode = match mode {
             "pattern" => PlaybackMode::Pattern,
@@ -726,7 +851,6 @@ impl GridoxideMcp {
 
     // === Arrangement Tools ===
 
-    /// Get full arrangement
     pub fn get_arrangement(&self) -> Value {
         let state = self.sequencer_state.read();
         let entries: Vec<Value> = state
@@ -758,7 +882,6 @@ impl GridoxideMcp {
         })
     }
 
-    /// Append entry to arrangement
     pub fn append_arrangement(&self, pattern: usize, repeats: usize) -> Value {
         if pattern >= NUM_PATTERNS {
             return json!({ "status": "error", "message": "Pattern must be 0-15" });
@@ -771,7 +894,6 @@ impl GridoxideMcp {
         })
     }
 
-    /// Insert entry into arrangement
     pub fn insert_arrangement(&self, position: usize, pattern: usize, repeats: usize) -> Value {
         if pattern >= NUM_PATTERNS {
             return json!({ "status": "error", "message": "Pattern must be 0-15" });
@@ -793,7 +915,6 @@ impl GridoxideMcp {
         })
     }
 
-    /// Remove entry from arrangement
     pub fn remove_arrangement(&self, position: usize) -> Value {
         let state = self.sequencer_state.read();
         if position >= state.arrangement.len() {
@@ -807,7 +928,6 @@ impl GridoxideMcp {
         })
     }
 
-    /// Modify an arrangement entry
     pub fn set_arrangement_entry(&self, position: usize, pattern: usize, repeats: usize) -> Value {
         if pattern >= NUM_PATTERNS {
             return json!({ "status": "error", "message": "Pattern must be 0-15" });
@@ -829,7 +949,6 @@ impl GridoxideMcp {
         })
     }
 
-    /// Clear arrangement
     pub fn clear_arrangement(&self) -> Value {
         self.dispatch(Command::ClearArrangement);
         json!({
@@ -840,7 +959,6 @@ impl GridoxideMcp {
 
     // === Project I/O Tools ===
 
-    /// Save project to a .grox JSON file
     pub fn save_project(&self, path_str: &str) -> Value {
         let path = Path::new(path_str);
         let state = self.sequencer_state.read();
@@ -857,7 +975,6 @@ impl GridoxideMcp {
         }
     }
 
-    /// Load project from a .grox JSON file
     pub fn load_project(&self, path_str: &str) -> Value {
         let path = Path::new(path_str);
         match project::load_project(path) {
@@ -877,7 +994,6 @@ impl GridoxideMcp {
         }
     }
 
-    /// Export audio as WAV file
     pub fn export_wav_file(&self, path_str: &str, mode: &str, pattern: Option<usize>) -> Value {
         let path = Path::new(path_str);
         let state = self.sequencer_state.read();
@@ -914,7 +1030,6 @@ impl GridoxideMcp {
         }
     }
 
-    /// List .grox project files in a directory
     pub fn list_projects(&self, directory: Option<&str>) -> Value {
         let dir = directory.unwrap_or(".");
         let path = Path::new(dir);
@@ -1018,9 +1133,24 @@ impl GridoxideMcp {
                 let value = args.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                 self.set_param(param, value)
             }
+            "set_track_param" => {
+                let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+                let value = args.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                self.set_track_param(track, key, value)
+            }
             "reset_track" => {
                 let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 self.reset_track(track)
+            }
+            "add_track" => {
+                let synth_type = args.get("synth_type").and_then(|v| v.as_str()).unwrap_or("kick");
+                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("NEW");
+                self.add_track(synth_type, name)
+            }
+            "remove_track" => {
+                let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                self.remove_track(track)
             }
 
             // Mixer
@@ -1144,67 +1274,41 @@ impl GridoxideMcp {
                 {
                     "name": "play",
                     "description": "Start playback",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
-                    }
+                    "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
                     "name": "pause",
                     "description": "Pause playback, keeping the current step position.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
-                    }
+                    "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
                     "name": "stop",
                     "description": "Stop playback and reset to step 0",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
-                    }
+                    "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
                     "name": "set_bpm",
                     "description": "Set the tempo in BPM (60-200)",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "bpm": {
-                                "type": "number",
-                                "description": "Tempo in beats per minute (60-200)"
-                            }
-                        },
+                        "properties": { "bpm": { "type": "number", "description": "Tempo in beats per minute (60-200)" } },
                         "required": ["bpm"]
                     }
                 },
                 {
                     "name": "get_state",
                     "description": "Get current transport state (playing, bpm, current_step, current_pattern, playback_mode, arrangement_position)",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
-                    }
+                    "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
                     "name": "toggle_step",
-                    "description": "Toggle a step on/off. Tracks: 0=kick, 1=snare, 2=hihat, 3=bass. Steps: 0-15.",
+                    "description": "Toggle a step on/off. Tracks: 0-based index. Steps: 0-15.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "track": {
-                                "type": "integer",
-                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
-                            },
-                            "step": {
-                                "type": "integer",
-                                "description": "Step index (0-15)"
-                            },
-                            "note": {
-                                "type": "integer",
-                                "description": "Optional MIDI note (0-127) to set before toggling. If omitted, uses the step's existing note."
-                            }
+                            "track": { "type": "integer", "description": "Track index (0-based)" },
+                            "step": { "type": "integer", "description": "Step index (0-15)" },
+                            "note": { "type": "integer", "description": "Optional MIDI note (0-127) to set before toggling. If omitted, uses the step's existing note." }
                         },
                         "required": ["track", "step"]
                     }
@@ -1214,32 +1318,18 @@ impl GridoxideMcp {
                     "description": "Get the full pattern grid showing all tracks and steps. Optionally specify a pattern slot (0-15) to view.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "pattern": {
-                                "type": "integer",
-                                "description": "Optional pattern slot index (0-15). If omitted, returns the active pattern."
-                            }
-                        }
+                        "properties": { "pattern": { "type": "integer", "description": "Optional pattern slot index (0-15). If omitted, returns the active pattern." } }
                     }
                 },
                 {
                     "name": "set_step_note",
-                    "description": "Set the MIDI note for a step. Each step can have its own pitch (0-127). Affects how the synth sounds when that step triggers.",
+                    "description": "Set the MIDI note for a step. Each step can have its own pitch (0-127).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "track": {
-                                "type": "integer",
-                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
-                            },
-                            "step": {
-                                "type": "integer",
-                                "description": "Step index (0-15)"
-                            },
-                            "note": {
-                                "type": "integer",
-                                "description": "MIDI note number (0-127). 60=C4, 69=A4(440Hz). Bass: sets frequency. Kick: scales pitch. Snare: scales tone. HiHat: scales brightness."
-                            }
+                            "track": { "type": "integer", "description": "Track index (0-based)" },
+                            "step": { "type": "integer", "description": "Step index (0-15)" },
+                            "note": { "type": "integer", "description": "MIDI note number (0-127). 60=C4, 69=A4(440Hz)." }
                         },
                         "required": ["track", "step", "note"]
                     }
@@ -1249,12 +1339,7 @@ impl GridoxideMcp {
                     "description": "Get all step data for a track including notes. Shows active state and MIDI note for each of the 16 steps.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "track": {
-                                "type": "integer",
-                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
-                            }
-                        },
+                        "properties": { "track": { "type": "integer", "description": "Track index (0-based)" } },
                         "required": ["track"]
                     }
                 },
@@ -1263,12 +1348,7 @@ impl GridoxideMcp {
                     "description": "Clear all steps on a track",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "track": {
-                                "type": "integer",
-                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
-                            }
-                        },
+                        "properties": { "track": { "type": "integer", "description": "Track index (0-based)" } },
                         "required": ["track"]
                     }
                 },
@@ -1277,12 +1357,7 @@ impl GridoxideMcp {
                     "description": "Fill all steps on a track (all 16 steps active)",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "track": {
-                                "type": "integer",
-                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
-                            }
-                        },
+                        "properties": { "track": { "type": "integer", "description": "Track index (0-based)" } },
                         "required": ["track"]
                     }
                 },
@@ -1291,52 +1366,46 @@ impl GridoxideMcp {
                     "description": "Get recent events/commands since a given ID. Use this to 'listen' to what the human is doing.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "since_id": {
-                                "type": "integer",
-                                "description": "Return events with ID greater than this value. Use 0 to get all recent events."
-                            }
-                        }
+                        "properties": { "since_id": { "type": "integer", "description": "Return events with ID greater than this value. Use 0 to get all recent events." } }
                     }
                 },
                 {
                     "name": "list_tracks",
                     "description": "List all tracks with their synth types and available parameters",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
-                    }
+                    "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
                     "name": "get_track_params",
                     "description": "Get all parameters for a specific track with current values, ranges, and defaults",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "track": {
-                                "type": "integer",
-                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
-                            }
-                        },
+                        "properties": { "track": { "type": "integer", "description": "Track index (0-based)" } },
                         "required": ["track"]
                     }
                 },
                 {
                     "name": "set_param",
-                    "description": "Set a synth parameter by key. Use list_tracks or get_track_params to see available parameter keys.",
+                    "description": "Set a synth parameter by key. Supports prefixed keys (e.g. 'kick_pitch_start') for backward compatibility. Use list_tracks or get_track_params to see available keys.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "param": {
-                                "type": "string",
-                                "description": "Parameter key (e.g., 'kick_pitch_start', 'snare_tone_freq', 'hihat_decay', 'bass_frequency')"
-                            },
-                            "value": {
-                                "type": "number",
-                                "description": "New value for the parameter (will be clamped to valid range)"
-                            }
+                            "param": { "type": "string", "description": "Parameter key (e.g., 'kick_pitch_start', 'pitch_start')" },
+                            "value": { "type": "number", "description": "New value for the parameter (will be clamped to valid range)" }
                         },
                         "required": ["param", "value"]
+                    }
+                },
+                {
+                    "name": "set_track_param",
+                    "description": "Set a parameter on a specific track by key. More explicit than set_param.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "track": { "type": "integer", "description": "Track index (0-based)" },
+                            "key": { "type": "string", "description": "Parameter key (e.g., 'pitch_start', 'decay')" },
+                            "value": { "type": "number", "description": "New value (will be clamped to valid range)" }
+                        },
+                        "required": ["track", "key", "value"]
                     }
                 },
                 {
@@ -1344,22 +1413,35 @@ impl GridoxideMcp {
                     "description": "Reset all parameters on a track to their default values",
                     "inputSchema": {
                         "type": "object",
+                        "properties": { "track": { "type": "integer", "description": "Track index (0-based)" } },
+                        "required": ["track"]
+                    }
+                },
+                {
+                    "name": "add_track",
+                    "description": "Add a new track with the specified synth type. Only works when playback is stopped.",
+                    "inputSchema": {
+                        "type": "object",
                         "properties": {
-                            "track": {
-                                "type": "integer",
-                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
-                            }
+                            "synth_type": { "type": "string", "description": "Synth type: 'kick', 'snare', 'hihat', or 'bass'" },
+                            "name": { "type": "string", "description": "Display name for the track" }
                         },
+                        "required": ["synth_type", "name"]
+                    }
+                },
+                {
+                    "name": "remove_track",
+                    "description": "Remove a track by index. Only works when playback is stopped. Cannot remove the last track.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": { "track": { "type": "integer", "description": "Track index (0-based)" } },
                         "required": ["track"]
                     }
                 },
                 {
                     "name": "get_mixer",
                     "description": "Get all mixer state (volumes, pans, mutes, solos) for all tracks",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
-                    }
+                    "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
                     "name": "set_volume",
@@ -1367,16 +1449,8 @@ impl GridoxideMcp {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "track": {
-                                "type": "integer",
-                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
-                            },
-                            "volume": {
-                                "type": "number",
-                                "description": "Volume level (0.0 to 1.0)",
-                                "minimum": 0.0,
-                                "maximum": 1.0
-                            }
+                            "track": { "type": "integer", "description": "Track index (0-based)" },
+                            "volume": { "type": "number", "description": "Volume level (0.0 to 1.0)", "minimum": 0.0, "maximum": 1.0 }
                         },
                         "required": ["track", "volume"]
                     }
@@ -1387,16 +1461,8 @@ impl GridoxideMcp {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "track": {
-                                "type": "integer",
-                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
-                            },
-                            "pan": {
-                                "type": "number",
-                                "description": "Pan position (-1.0 = full left, 0.0 = center, 1.0 = full right)",
-                                "minimum": -1.0,
-                                "maximum": 1.0
-                            }
+                            "track": { "type": "integer", "description": "Track index (0-based)" },
+                            "pan": { "type": "number", "description": "Pan position (-1.0 = full left, 0.0 = center, 1.0 = full right)", "minimum": -1.0, "maximum": 1.0 }
                         },
                         "required": ["track", "pan"]
                     }
@@ -1406,12 +1472,7 @@ impl GridoxideMcp {
                     "description": "Toggle mute on a track. Muted tracks produce no audio.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "track": {
-                                "type": "integer",
-                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
-                            }
-                        },
+                        "properties": { "track": { "type": "integer", "description": "Track index (0-based)" } },
                         "required": ["track"]
                     }
                 },
@@ -1420,12 +1481,7 @@ impl GridoxideMcp {
                     "description": "Toggle solo on a track. When any track is soloed, only soloed tracks are audible.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "track": {
-                                "type": "integer",
-                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
-                            }
-                        },
+                        "properties": { "track": { "type": "integer", "description": "Track index (0-based)" } },
                         "required": ["track"]
                     }
                 },
@@ -1434,12 +1490,7 @@ impl GridoxideMcp {
                     "description": "Get all FX parameters for a track (filter, distortion, delay) with current values and ranges.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "track": {
-                                "type": "integer",
-                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
-                            }
-                        },
+                        "properties": { "track": { "type": "integer", "description": "Track index (0-based)" } },
                         "required": ["track"]
                     }
                 },
@@ -1449,18 +1500,9 @@ impl GridoxideMcp {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "track": {
-                                "type": "integer",
-                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
-                            },
-                            "param": {
-                                "type": "string",
-                                "description": "Parameter key (e.g., 'filter_cutoff', 'dist_drive', 'delay_time')"
-                            },
-                            "value": {
-                                "type": "number",
-                                "description": "New value (will be clamped to valid range)"
-                            }
+                            "track": { "type": "integer", "description": "Track index (0-based)" },
+                            "param": { "type": "string", "description": "Parameter key (e.g., 'filter_cutoff', 'dist_drive', 'delay_time')" },
+                            "value": { "type": "number", "description": "New value (will be clamped to valid range)" }
                         },
                         "required": ["track", "param", "value"]
                     }
@@ -1471,14 +1513,8 @@ impl GridoxideMcp {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "track": {
-                                "type": "integer",
-                                "description": "Track index (0=kick, 1=snare, 2=hihat, 3=bass)"
-                            },
-                            "fx": {
-                                "type": "string",
-                                "description": "Effect name: 'filter', 'distortion', or 'delay'"
-                            }
+                            "track": { "type": "integer", "description": "Track index (0-based)" },
+                            "fx": { "type": "string", "description": "Effect name: 'filter', 'distortion', or 'delay'" }
                         },
                         "required": ["track", "fx"]
                     }
@@ -1486,10 +1522,7 @@ impl GridoxideMcp {
                 {
                     "name": "get_master_fx_params",
                     "description": "Get master bus FX parameters (reverb) with current values and ranges.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
-                    }
+                    "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
                     "name": "set_master_fx_param",
@@ -1497,14 +1530,8 @@ impl GridoxideMcp {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "param": {
-                                "type": "string",
-                                "description": "Parameter key: 'reverb_decay', 'reverb_mix', or 'reverb_damping'"
-                            },
-                            "value": {
-                                "type": "number",
-                                "description": "New value (will be clamped to valid range)"
-                            }
+                            "param": { "type": "string", "description": "Parameter key: 'reverb_decay', 'reverb_mix', or 'reverb_damping'" },
+                            "value": { "type": "number", "description": "New value (will be clamped to valid range)" }
                         },
                         "required": ["param", "value"]
                     }
@@ -1512,32 +1539,21 @@ impl GridoxideMcp {
                 {
                     "name": "toggle_master_fx",
                     "description": "Toggle master reverb on/off.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
-                    }
+                    "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
                     "name": "select_pattern",
                     "description": "Switch the active pattern slot (0-15). When playing, the switch happens at the next pattern boundary.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "pattern": {
-                                "type": "integer",
-                                "description": "Pattern slot index (0-15)"
-                            }
-                        },
+                        "properties": { "pattern": { "type": "integer", "description": "Pattern slot index (0-15)" } },
                         "required": ["pattern"]
                     }
                 },
                 {
                     "name": "get_pattern_bank",
                     "description": "Get an overview of all 16 pattern slots showing which have active steps.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
-                    }
+                    "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
                     "name": "copy_pattern",
@@ -1545,14 +1561,8 @@ impl GridoxideMcp {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "src": {
-                                "type": "integer",
-                                "description": "Source pattern slot (0-15)"
-                            },
-                            "dst": {
-                                "type": "integer",
-                                "description": "Destination pattern slot (0-15)"
-                            }
+                            "src": { "type": "integer", "description": "Source pattern slot (0-15)" },
+                            "dst": { "type": "integer", "description": "Destination pattern slot (0-15)" }
                         },
                         "required": ["src", "dst"]
                     }
@@ -1562,12 +1572,7 @@ impl GridoxideMcp {
                     "description": "Clear all tracks in a pattern slot.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "pattern": {
-                                "type": "integer",
-                                "description": "Pattern slot index (0-15)"
-                            }
-                        },
+                        "properties": { "pattern": { "type": "integer", "description": "Pattern slot index (0-15)" } },
                         "required": ["pattern"]
                     }
                 },
@@ -1576,22 +1581,14 @@ impl GridoxideMcp {
                     "description": "Switch between pattern mode (loop single pattern) and song mode (play through arrangement).",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "mode": {
-                                "type": "string",
-                                "description": "Playback mode: 'pattern' or 'song'"
-                            }
-                        },
+                        "properties": { "mode": { "type": "string", "description": "Playback mode: 'pattern' or 'song'" } },
                         "required": ["mode"]
                     }
                 },
                 {
                     "name": "get_arrangement",
                     "description": "Get the full arrangement (list of pattern entries with repeat counts).",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
-                    }
+                    "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
                     "name": "append_arrangement",
@@ -1599,14 +1596,8 @@ impl GridoxideMcp {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "pattern": {
-                                "type": "integer",
-                                "description": "Pattern slot index (0-15)"
-                            },
-                            "repeats": {
-                                "type": "integer",
-                                "description": "Number of times to repeat (1-16, default: 1)"
-                            }
+                            "pattern": { "type": "integer", "description": "Pattern slot index (0-15)" },
+                            "repeats": { "type": "integer", "description": "Number of times to repeat (1-16, default: 1)" }
                         },
                         "required": ["pattern"]
                     }
@@ -1617,18 +1608,9 @@ impl GridoxideMcp {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "position": {
-                                "type": "integer",
-                                "description": "Position to insert at (0-based)"
-                            },
-                            "pattern": {
-                                "type": "integer",
-                                "description": "Pattern slot index (0-15)"
-                            },
-                            "repeats": {
-                                "type": "integer",
-                                "description": "Number of times to repeat (1-16, default: 1)"
-                            }
+                            "position": { "type": "integer", "description": "Position to insert at (0-based)" },
+                            "pattern": { "type": "integer", "description": "Pattern slot index (0-15)" },
+                            "repeats": { "type": "integer", "description": "Number of times to repeat (1-16, default: 1)" }
                         },
                         "required": ["position", "pattern"]
                     }
@@ -1638,12 +1620,7 @@ impl GridoxideMcp {
                     "description": "Remove an entry from the arrangement by position.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "position": {
-                                "type": "integer",
-                                "description": "Position to remove (0-based)"
-                            }
-                        },
+                        "properties": { "position": { "type": "integer", "description": "Position to remove (0-based)" } },
                         "required": ["position"]
                     }
                 },
@@ -1653,18 +1630,9 @@ impl GridoxideMcp {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "position": {
-                                "type": "integer",
-                                "description": "Position to modify (0-based)"
-                            },
-                            "pattern": {
-                                "type": "integer",
-                                "description": "Pattern slot index (0-15)"
-                            },
-                            "repeats": {
-                                "type": "integer",
-                                "description": "Number of times to repeat (1-16)"
-                            }
+                            "position": { "type": "integer", "description": "Position to modify (0-based)" },
+                            "pattern": { "type": "integer", "description": "Pattern slot index (0-15)" },
+                            "repeats": { "type": "integer", "description": "Number of times to repeat (1-16)" }
                         },
                         "required": ["position", "pattern", "repeats"]
                     }
@@ -1672,22 +1640,14 @@ impl GridoxideMcp {
                 {
                     "name": "clear_arrangement",
                     "description": "Remove all entries from the arrangement.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
-                    }
+                    "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
                     "name": "save_project",
                     "description": "Save the current project state to a .grox JSON file.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "path": {
-                                "type": "string",
-                                "description": "File path to save to (e.g., 'my_song.grox')"
-                            }
-                        },
+                        "properties": { "path": { "type": "string", "description": "File path to save to (e.g., 'my_song.grox')" } },
                         "required": ["path"]
                     }
                 },
@@ -1696,12 +1656,7 @@ impl GridoxideMcp {
                     "description": "Load a project from a .grox JSON file. Stops playback and replaces all state.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "path": {
-                                "type": "string",
-                                "description": "File path to load from (e.g., 'my_song.grox')"
-                            }
-                        },
+                        "properties": { "path": { "type": "string", "description": "File path to load from (e.g., 'my_song.grox')" } },
                         "required": ["path"]
                     }
                 },
@@ -1711,18 +1666,9 @@ impl GridoxideMcp {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "path": {
-                                "type": "string",
-                                "description": "Output WAV file path (e.g., 'export.wav')"
-                            },
-                            "mode": {
-                                "type": "string",
-                                "description": "Export mode: 'pattern' (single pattern loop) or 'song' (full arrangement)"
-                            },
-                            "pattern": {
-                                "type": "integer",
-                                "description": "Pattern index (0-15) for pattern mode. Defaults to current pattern."
-                            }
+                            "path": { "type": "string", "description": "Output WAV file path (e.g., 'export.wav')" },
+                            "mode": { "type": "string", "description": "Export mode: 'pattern' (single pattern loop) or 'song' (full arrangement)" },
+                            "pattern": { "type": "integer", "description": "Pattern index (0-15) for pattern mode. Defaults to current pattern." }
                         },
                         "required": ["path", "mode"]
                     }
@@ -1732,12 +1678,7 @@ impl GridoxideMcp {
                     "description": "List .grox project files in a directory.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "directory": {
-                                "type": "string",
-                                "description": "Directory to search (defaults to current directory)"
-                            }
-                        }
+                        "properties": { "directory": { "type": "string", "description": "Directory to search (defaults to current directory)" } }
                     }
                 }
             ]

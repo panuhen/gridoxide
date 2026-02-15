@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
 use parking_lot::RwLock;
+use serde_json::Value;
 
 use crate::command::{Command, CommandReceiver};
 use crate::fx::{
@@ -14,9 +15,22 @@ use crate::sequencer::{
     Arrangement, Clock, Pattern, PatternBank, PlaybackMode, NUM_PATTERNS,
 };
 use crate::synth::{
-    BassParams, BassSynth, HiHatParams, HiHatSynth, KickParams, KickSynth, ParamId, SnareParams,
-    SnareSynth,
+    create_synth, SoundSource, SynthType,
 };
+
+/// Per-track state shared between audio thread and UI/MCP
+#[derive(Clone, Debug)]
+pub struct TrackState {
+    pub synth_type: SynthType,
+    pub name: String,
+    pub default_note: u8,
+    pub params_snapshot: Value,
+    pub volume: f32,
+    pub pan: f32,
+    pub mute: bool,
+    pub solo: bool,
+    pub fx: TrackFxState,
+}
 
 /// Shared state between audio thread and UI/MCP
 #[derive(Clone, Debug)]
@@ -25,18 +39,9 @@ pub struct SequencerState {
     pub bpm: f32,
     pub current_step: usize,
     pub pattern: Pattern,
-    // Synth parameters
-    pub kick_params: KickParams,
-    pub snare_params: SnareParams,
-    pub hihat_params: HiHatParams,
-    pub bass_params: BassParams,
-    // Mixer state
-    pub track_volumes: [f32; 4],
-    pub track_pans: [f32; 4],
-    pub track_mutes: [bool; 4],
-    pub track_solos: [bool; 4],
-    // FX state
-    pub track_fx: [TrackFxState; 4],
+    // Dynamic tracks
+    pub tracks: Vec<TrackState>,
+    // Master FX
     pub master_fx: MasterFxState,
     // Pattern bank + arrangement
     pub pattern_bank: PatternBank,
@@ -49,25 +54,33 @@ pub struct SequencerState {
 
 impl SequencerState {
     pub fn new() -> Self {
+        let default_synths = [
+            (SynthType::Kick, "KICK", 36u8),
+            (SynthType::Snare, "SNARE", 50u8),
+            (SynthType::HiHat, "HIHAT", 60u8),
+            (SynthType::Bass, "BASS", 33u8),
+        ];
+        let tracks: Vec<TrackState> = default_synths
+            .iter()
+            .map(|(synth_type, name, default_note)| TrackState {
+                synth_type: *synth_type,
+                name: name.to_string(),
+                default_note: *default_note,
+                params_snapshot: Value::Null,
+                volume: 0.8,
+                pan: 0.0,
+                mute: false,
+                solo: false,
+                fx: TrackFxState::default(),
+            })
+            .collect();
+
         Self {
             playing: false,
             bpm: 120.0,
             current_step: 0,
             pattern: Pattern::new(),
-            kick_params: KickParams::default(),
-            snare_params: SnareParams::default(),
-            hihat_params: HiHatParams::default(),
-            bass_params: BassParams::default(),
-            track_volumes: [0.8; 4],
-            track_pans: [0.0; 4],
-            track_mutes: [false; 4],
-            track_solos: [false; 4],
-            track_fx: [
-                TrackFxState::default(),
-                TrackFxState::default(),
-                TrackFxState::default(),
-                TrackFxState::default(),
-            ],
+            tracks,
             master_fx: MasterFxState::default(),
             pattern_bank: PatternBank::new(),
             current_pattern: 0,
@@ -76,6 +89,11 @@ impl SequencerState {
             arrangement_position: 0,
             arrangement_repeat: 0,
         }
+    }
+
+    /// Number of tracks
+    pub fn num_tracks(&self) -> usize {
+        self.tracks.len()
     }
 }
 
@@ -135,12 +153,15 @@ impl AudioEngine {
     {
         let sample_rate = config.sample_rate.0 as f32;
         let channels = config.channels as usize;
+        let num_tracks = 4usize; // default
 
-        // Initialize synths
-        let mut kick = KickSynth::new(sample_rate);
-        let mut snare = SnareSynth::new(sample_rate);
-        let mut hihat = HiHatSynth::new(sample_rate);
-        let mut bass = BassSynth::new(sample_rate);
+        // Initialize synths dynamically
+        let mut synths: Vec<Box<dyn SoundSource>> = vec![
+            create_synth(SynthType::Kick, sample_rate, None),
+            create_synth(SynthType::Snare, sample_rate, None),
+            create_synth(SynthType::HiHat, sample_rate, None),
+            create_synth(SynthType::Bass, sample_rate, None),
+        ];
 
         // Initialize clock
         let mut clock = Clock::new(sample_rate, 120.0);
@@ -157,27 +178,21 @@ impl AudioEngine {
         let mut local_arrangement_repeat: usize = 0;
         let mut pending_pattern_switch: Option<usize> = None;
 
-        // Local mixer state
-        let mut local_volumes = [0.8f32; 4];
-        let mut local_pans = [0.0f32; 4];
-        let mut local_mutes = [false; 4];
-        let mut local_solos = [false; 4];
+        // Local mixer state (dynamic)
+        let mut local_volumes: Vec<f32> = vec![0.8; num_tracks];
+        let mut local_pans: Vec<f32> = vec![0.0; num_tracks];
+        let mut local_mutes: Vec<bool> = vec![false; num_tracks];
+        let mut local_solos: Vec<bool> = vec![false; num_tracks];
 
         // Per-track FX chains
-        let mut fx_chains = [
-            TrackFxChain::new(sample_rate),
-            TrackFxChain::new(sample_rate),
-            TrackFxChain::new(sample_rate),
-            TrackFxChain::new(sample_rate),
-        ];
+        let mut fx_chains: Vec<TrackFxChain> = (0..num_tracks)
+            .map(|_| TrackFxChain::new(sample_rate))
+            .collect();
 
         // Local FX state for syncing to shared state
-        let mut local_track_fx = [
-            TrackFxState::default(),
-            TrackFxState::default(),
-            TrackFxState::default(),
-            TrackFxState::default(),
-        ];
+        let mut local_track_fx: Vec<TrackFxState> = (0..num_tracks)
+            .map(|_| TrackFxState::default())
+            .collect();
         let mut local_master_fx = MasterFxState::default();
 
         // Master reverb
@@ -191,6 +206,8 @@ impl AudioEngine {
         let stream = device.build_output_stream(
             config,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                let num_synths = synths.len();
+
                 // Process commands from the command bus
                 while let Some((cmd, _source)) = command_rx.try_recv() {
                     match cmd {
@@ -210,7 +227,7 @@ impl AudioEngine {
                             clock.stop();
                             // Apply any pending pattern switch immediately on stop
                             if let Some(new_pat) = pending_pattern_switch.take() {
-                                local_pattern_bank.get_mut(local_current_pattern).steps = pattern.steps;
+                                local_pattern_bank.get_mut(local_current_pattern).steps = pattern.steps.clone();
                                 local_current_pattern = new_pat;
                                 pattern = local_pattern_bank.get(new_pat).clone();
                             }
@@ -233,126 +250,108 @@ impl AudioEngine {
                             }
                         }
                         Command::ToggleStep { track, step } => {
-                            pattern.toggle(track, step);
-                            local_pattern_bank.get_mut(local_current_pattern).toggle(track, step);
-                            if let Some(mut state) = state.try_write() {
-                                state.pattern = pattern.clone();
-                                state.pattern_bank.get_mut(local_current_pattern).steps = pattern.steps;
+                            if track < num_synths {
+                                pattern.toggle(track, step);
+                                local_pattern_bank.get_mut(local_current_pattern).toggle(track, step);
+                                if let Some(mut state) = state.try_write() {
+                                    state.pattern = pattern.clone();
+                                    state.pattern_bank.get_mut(local_current_pattern).steps = pattern.steps.clone();
+                                }
                             }
                         }
                         Command::ClearTrack(track) => {
-                            pattern.clear_track(track);
-                            local_pattern_bank.get_mut(local_current_pattern).clear_track(track);
-                            if let Some(mut state) = state.try_write() {
-                                state.pattern = pattern.clone();
-                                state.pattern_bank.get_mut(local_current_pattern).steps = pattern.steps;
+                            if track < num_synths {
+                                pattern.clear_track(track);
+                                local_pattern_bank.get_mut(local_current_pattern).clear_track(track);
+                                if let Some(mut state) = state.try_write() {
+                                    state.pattern = pattern.clone();
+                                    state.pattern_bank.get_mut(local_current_pattern).steps = pattern.steps.clone();
+                                }
                             }
                         }
                         Command::FillTrack(track) => {
-                            pattern.fill_track(track);
-                            local_pattern_bank.get_mut(local_current_pattern).fill_track(track);
-                            if let Some(mut state) = state.try_write() {
-                                state.pattern = pattern.clone();
-                                state.pattern_bank.get_mut(local_current_pattern).steps = pattern.steps;
+                            if track < num_synths {
+                                pattern.fill_track(track);
+                                local_pattern_bank.get_mut(local_current_pattern).fill_track(track);
+                                if let Some(mut state) = state.try_write() {
+                                    state.pattern = pattern.clone();
+                                    state.pattern_bank.get_mut(local_current_pattern).steps = pattern.steps.clone();
+                                }
                             }
                         }
                         Command::SetStepNote { track, step, note } => {
-                            pattern.set_note(track, step, note);
-                            local_pattern_bank.get_mut(local_current_pattern).set_note(track, step, note);
-                            if let Some(mut state) = state.try_write() {
-                                state.pattern.set_note(track, step, note);
-                                state.pattern_bank.get_mut(local_current_pattern).set_note(track, step, note);
+                            if track < num_synths {
+                                pattern.set_note(track, step, note);
+                                local_pattern_bank.get_mut(local_current_pattern).set_note(track, step, note);
+                                if let Some(mut state) = state.try_write() {
+                                    state.pattern.set_note(track, step, note);
+                                    state.pattern_bank.get_mut(local_current_pattern).set_note(track, step, note);
+                                }
                             }
                         }
-                        // Synth parameter commands
-                        Command::SetKickParams(params) => {
-                            kick.set_params(params.clone());
-                            if let Some(mut state) = state.try_write() {
-                                state.kick_params = params;
-                            }
-                        }
-                        Command::SetSnareParams(params) => {
-                            snare.set_params(params.clone());
-                            if let Some(mut state) = state.try_write() {
-                                state.snare_params = params;
-                            }
-                        }
-                        Command::SetHiHatParams(params) => {
-                            hihat.set_params(params.clone());
-                            if let Some(mut state) = state.try_write() {
-                                state.hihat_params = params;
-                            }
-                        }
-                        Command::SetBassParams(params) => {
-                            bass.set_params(params.clone());
-                            if let Some(mut state) = state.try_write() {
-                                state.bass_params = params;
-                            }
-                        }
-                        Command::SetParam { param, value } => {
-                            // Apply single parameter change
-                            apply_param(
-                                &mut kick, &mut snare, &mut hihat, &mut bass, param, value,
-                            );
-                            // Update shared state
-                            if let Some(mut state) = state.try_write() {
-                                update_state_param(&mut state, param, value);
+                        // Dynamic track parameter
+                        Command::SetTrackParam { track, ref key, value } => {
+                            if track < num_synths {
+                                synths[track].set_param(key, value);
+                                if let Some(mut state) = state.try_write() {
+                                    state.tracks[track].params_snapshot = synths[track].serialize_params();
+                                }
                             }
                         }
                         Command::SetTrackVolume { track, volume } => {
-                            if track < 4 {
+                            if track < num_synths {
                                 let v = volume.clamp(0.0, 1.0);
                                 local_volumes[track] = v;
                                 if let Some(mut state) = state.try_write() {
-                                    state.track_volumes[track] = v;
+                                    state.tracks[track].volume = v;
                                 }
                             }
                         }
                         Command::SetTrackPan { track, pan } => {
-                            if track < 4 {
+                            if track < num_synths {
                                 let p = pan.clamp(-1.0, 1.0);
                                 local_pans[track] = p;
                                 if let Some(mut state) = state.try_write() {
-                                    state.track_pans[track] = p;
+                                    state.tracks[track].pan = p;
                                 }
                             }
                         }
                         Command::ToggleMute(track) => {
-                            if track < 4 {
+                            if track < num_synths {
                                 local_mutes[track] = !local_mutes[track];
                                 if let Some(mut state) = state.try_write() {
-                                    state.track_mutes[track] = local_mutes[track];
+                                    state.tracks[track].mute = local_mutes[track];
                                 }
                             }
                         }
                         Command::ToggleSolo(track) => {
-                            if track < 4 {
+                            if track < num_synths {
                                 local_solos[track] = !local_solos[track];
                                 if let Some(mut state) = state.try_write() {
-                                    state.track_solos[track] = local_solos[track];
+                                    state.tracks[track].solo = local_solos[track];
                                 }
                             }
                         }
                         // Per-track FX commands
                         Command::SetFxParam { track, param, value } => {
-                            if track < 4 {
+                            if track < num_synths {
                                 apply_fx_param(&mut fx_chains[track], &mut local_track_fx[track], param, value);
                                 if let Some(mut state) = state.try_write() {
-                                    state.track_fx[track] = local_track_fx[track].clone();
+                                    state.tracks[track].fx = local_track_fx[track].clone();
                                 }
                             }
                         }
                         Command::SetFxFilterType { track, filter_type } => {
-                            if track < 4 {
+                            if track < num_synths {
                                 fx_chains[track].filter.set_filter_type(filter_type);
                                 local_track_fx[track].filter_type = filter_type;
                                 if let Some(mut state) = state.try_write() {
-                                    state.track_fx[track].filter_type = filter_type;
+                                    state.tracks[track].fx.filter_type = filter_type;
                                 }
                             }
                         }
                         Command::ToggleFxEnabled { track, fx } => {
-                            if track < 4 {
+                            if track < num_synths {
                                 match fx {
                                     FxType::Filter => {
                                         fx_chains[track].filter_enabled = !fx_chains[track].filter_enabled;
@@ -368,7 +367,7 @@ impl AudioEngine {
                                     }
                                 }
                                 if let Some(mut state) = state.try_write() {
-                                    state.track_fx[track] = local_track_fx[track].clone();
+                                    state.tracks[track].fx = local_track_fx[track].clone();
                                 }
                             }
                         }
@@ -392,7 +391,7 @@ impl AudioEngine {
                         Command::SelectPattern(p) => {
                             if p < NUM_PATTERNS {
                                 // Save current pattern to bank
-                                local_pattern_bank.get_mut(local_current_pattern).steps = pattern.steps;
+                                local_pattern_bank.get_mut(local_current_pattern).steps = pattern.steps.clone();
 
                                 if clock.is_playing() {
                                     // Queue for boundary switch
@@ -499,29 +498,95 @@ impl AudioEngine {
                             }
                         }
 
+                        Command::AddTrack { synth_type, ref name } => {
+                            if !clock.is_playing() {
+                                let new_synth = create_synth(synth_type, sample_rate, None);
+                                let default_note = new_synth.default_note();
+                                synths.push(new_synth);
+                                local_volumes.push(0.8);
+                                local_pans.push(0.0);
+                                local_mutes.push(false);
+                                local_solos.push(false);
+                                fx_chains.push(TrackFxChain::new(sample_rate));
+                                local_track_fx.push(TrackFxState::default());
+                                // Add track to all patterns
+                                for pat in local_pattern_bank.patterns.iter_mut() {
+                                    pat.add_track(default_note);
+                                }
+                                pattern = local_pattern_bank.get(local_current_pattern).clone();
+                                if let Some(mut state) = state.try_write() {
+                                    state.tracks.push(TrackState {
+                                        synth_type,
+                                        name: name.clone(),
+                                        default_note,
+                                        params_snapshot: synths.last().unwrap().serialize_params(),
+                                        volume: 0.8,
+                                        pan: 0.0,
+                                        mute: false,
+                                        solo: false,
+                                        fx: TrackFxState::default(),
+                                    });
+                                    state.pattern_bank = local_pattern_bank.clone();
+                                    state.pattern = pattern.clone();
+                                }
+                            }
+                        }
+
+                        Command::RemoveTrack(track) => {
+                            if !clock.is_playing() && track < synths.len() && synths.len() > 1 {
+                                synths.remove(track);
+                                local_volumes.remove(track);
+                                local_pans.remove(track);
+                                local_mutes.remove(track);
+                                local_solos.remove(track);
+                                fx_chains.remove(track);
+                                local_track_fx.remove(track);
+                                // Remove track from all patterns
+                                for pat in local_pattern_bank.patterns.iter_mut() {
+                                    pat.remove_track(track);
+                                }
+                                pattern = local_pattern_bank.get(local_current_pattern).clone();
+                                if let Some(mut state) = state.try_write() {
+                                    state.tracks.remove(track);
+                                    state.pattern_bank = local_pattern_bank.clone();
+                                    state.pattern = pattern.clone();
+                                }
+                            }
+                        }
+
                         Command::LoadProject(new_state) => {
                             // Stop playback
                             clock.stop();
                             clock.set_bpm(new_state.bpm);
                             pending_pattern_switch = None;
 
-                            // Restore synth params
-                            kick.set_params(new_state.kick_params.clone());
-                            snare.set_params(new_state.snare_params.clone());
-                            hihat.set_params(new_state.hihat_params.clone());
-                            bass.set_params(new_state.bass_params.clone());
+                            // Reconstruct synths from track data
+                            synths.clear();
+                            local_volumes.clear();
+                            local_pans.clear();
+                            local_mutes.clear();
+                            local_solos.clear();
+                            fx_chains.clear();
+                            local_track_fx.clear();
 
-                            // Restore mixer
-                            local_volumes = new_state.track_volumes;
-                            local_pans = new_state.track_pans;
-                            local_mutes = new_state.track_mutes;
-                            local_solos = new_state.track_solos;
-
-                            // Restore FX
-                            for i in 0..4 {
-                                configure_fx_chain(&mut fx_chains[i], &new_state.track_fx[i]);
-                                local_track_fx[i] = new_state.track_fx[i].clone();
+                            for track in &new_state.tracks {
+                                let synth = create_synth(
+                                    track.synth_type,
+                                    sample_rate,
+                                    Some(&track.params_snapshot),
+                                );
+                                synths.push(synth);
+                                local_volumes.push(track.volume);
+                                local_pans.push(track.pan);
+                                local_mutes.push(track.mute);
+                                local_solos.push(track.solo);
+                                let mut chain = TrackFxChain::new(sample_rate);
+                                configure_fx_chain(&mut chain, &track.fx);
+                                fx_chains.push(chain);
+                                local_track_fx.push(track.fx.clone());
                             }
+
+                            // Restore master FX
                             reverb.set_decay(new_state.master_fx.reverb_decay);
                             reverb.set_mix(new_state.master_fx.reverb_mix);
                             reverb.set_damping(new_state.master_fx.reverb_damping);
@@ -551,24 +616,16 @@ impl AudioEngine {
 
                 // Generate audio
                 for frame in data.chunks_mut(channels) {
+                    let num_synths = synths.len();
+
                     // Check for step trigger
                     if let Some(step) = clock.tick() {
-                        // Trigger synths based on pattern, passing per-step notes
-                        let s0 = pattern.get_step(0, step);
-                        if s0.active {
-                            kick.trigger_with_note(s0.note);
-                        }
-                        let s1 = pattern.get_step(1, step);
-                        if s1.active {
-                            snare.trigger_with_note(s1.note);
-                        }
-                        let s2 = pattern.get_step(2, step);
-                        if s2.active {
-                            hihat.trigger_with_note(s2.note);
-                        }
-                        let s3 = pattern.get_step(3, step);
-                        if s3.active {
-                            bass.trigger_with_note(s3.note);
+                        // Trigger synths based on pattern
+                        for i in 0..num_synths {
+                            let sd = pattern.get_step(i, step);
+                            if sd.active {
+                                synths[i].trigger_with_note(sd.note);
+                            }
                         }
                     }
 
@@ -578,7 +635,7 @@ impl AudioEngine {
                             PlaybackMode::Pattern => {
                                 // Apply pending pattern switch at boundary
                                 if let Some(new_pat) = pending_pattern_switch.take() {
-                                    local_pattern_bank.get_mut(local_current_pattern).steps = pattern.steps;
+                                    local_pattern_bank.get_mut(local_current_pattern).steps = pattern.steps.clone();
                                     local_current_pattern = new_pat;
                                     pattern = local_pattern_bank.get(new_pat).clone();
                                     if let Some(mut state) = state.try_write() {
@@ -599,7 +656,7 @@ impl AudioEngine {
                                             % local_arrangement.len();
                                         // Load new pattern from bank
                                         let new_entry = local_arrangement.entries[local_arrangement_position];
-                                        local_pattern_bank.get_mut(local_current_pattern).steps = pattern.steps;
+                                        local_pattern_bank.get_mut(local_current_pattern).steps = pattern.steps.clone();
                                         local_current_pattern = new_entry.pattern;
                                         pattern = local_pattern_bank.get(new_entry.pattern).clone();
                                         if let Some(mut state) = state.try_write() {
@@ -617,19 +674,12 @@ impl AudioEngine {
                     }
 
                     // Get raw synth output and apply per-track FX
-                    let raw = [
-                        fx_chains[0].process(kick.next_sample()),
-                        fx_chains[1].process(snare.next_sample()),
-                        fx_chains[2].process(hihat.next_sample()),
-                        fx_chains[3].process(bass.next_sample()),
-                    ];
-
-                    // Mix with per-track volume, pan, mute, solo
                     let any_solo = local_solos.iter().any(|&s| s);
 
                     let mut left = 0.0f32;
                     let mut right = 0.0f32;
-                    for i in 0..4 {
+                    for i in 0..num_synths {
+                        let raw = fx_chains[i].process(synths[i].next_sample());
                         let audible = if any_solo {
                             local_solos[i]
                         } else {
@@ -638,8 +688,7 @@ impl AudioEngine {
                         if !audible {
                             continue;
                         }
-                        let s = raw[i] * local_volumes[i];
-                        // Equal-power pan: pan -1.0 = full left, 0.0 = center, 1.0 = full right
+                        let s = raw * local_volumes[i];
                         let angle = (local_pans[i] + 1.0) * 0.25 * std::f32::consts::PI;
                         left += s * angle.cos();
                         right += s * angle.sin();
@@ -666,7 +715,7 @@ impl AudioEngine {
                         *channel_sample = T::from_sample(sample);
                     }
 
-                    // Periodic state sync (for UI to read current_step + full pattern)
+                    // Periodic state sync (for UI to read current_step + params snapshots)
                     sync_counter += 1;
                     if sync_counter >= sync_interval {
                         sync_counter = 0;
@@ -678,6 +727,12 @@ impl AudioEngine {
                             state.playback_mode = local_playback_mode;
                             state.arrangement_position = local_arrangement_position;
                             state.arrangement_repeat = local_arrangement_repeat;
+                            // Sync param snapshots
+                            for (i, synth) in synths.iter().enumerate() {
+                                if i < state.tracks.len() {
+                                    state.tracks[i].params_snapshot = synth.serialize_params();
+                                }
+                            }
                         }
                     }
                 }
@@ -751,137 +806,6 @@ fn apply_master_fx_param(reverb: &mut StereoReverb, local: &mut MasterFxState, p
             reverb.set_damping(v);
             local.reverb_damping = v;
         }
-    }
-}
-
-/// Apply a single parameter change to the appropriate synth
-fn apply_param(
-    kick: &mut KickSynth,
-    snare: &mut SnareSynth,
-    hihat: &mut HiHatSynth,
-    bass: &mut BassSynth,
-    param: ParamId,
-    value: f32,
-) {
-    match param {
-        // Kick parameters
-        ParamId::KickPitchStart => {
-            let mut p = kick.params().clone();
-            p.pitch_start = value;
-            kick.set_params(p);
-        }
-        ParamId::KickPitchEnd => {
-            let mut p = kick.params().clone();
-            p.pitch_end = value;
-            kick.set_params(p);
-        }
-        ParamId::KickPitchDecay => {
-            let mut p = kick.params().clone();
-            p.pitch_decay = value;
-            kick.set_params(p);
-        }
-        ParamId::KickAmpDecay => {
-            let mut p = kick.params().clone();
-            p.amp_decay = value;
-            kick.set_params(p);
-        }
-        ParamId::KickClick => {
-            let mut p = kick.params().clone();
-            p.click = value;
-            kick.set_params(p);
-        }
-        ParamId::KickDrive => {
-            let mut p = kick.params().clone();
-            p.drive = value;
-            kick.set_params(p);
-        }
-        // Snare parameters
-        ParamId::SnareToneFreq => {
-            let mut p = snare.params().clone();
-            p.tone_freq = value;
-            snare.set_params(p);
-        }
-        ParamId::SnareToneDecay => {
-            let mut p = snare.params().clone();
-            p.tone_decay = value;
-            snare.set_params(p);
-        }
-        ParamId::SnareNoiseDecay => {
-            let mut p = snare.params().clone();
-            p.noise_decay = value;
-            snare.set_params(p);
-        }
-        ParamId::SnareToneMix => {
-            let mut p = snare.params().clone();
-            p.tone_mix = value;
-            snare.set_params(p);
-        }
-        ParamId::SnareSnappy => {
-            let mut p = snare.params().clone();
-            p.snappy = value;
-            snare.set_params(p);
-        }
-        // HiHat parameters
-        ParamId::HiHatDecay => {
-            let mut p = hihat.params().clone();
-            p.decay = value;
-            hihat.set_params(p);
-        }
-        ParamId::HiHatTone => {
-            let mut p = hihat.params().clone();
-            p.tone = value;
-            hihat.set_params(p);
-        }
-        ParamId::HiHatOpen => {
-            let mut p = hihat.params().clone();
-            p.open = value;
-            hihat.set_params(p);
-        }
-        // Bass parameters
-        ParamId::BassFrequency => {
-            let mut p = bass.params().clone();
-            p.frequency = value;
-            bass.set_params(p);
-        }
-        ParamId::BassDecay => {
-            let mut p = bass.params().clone();
-            p.decay = value;
-            bass.set_params(p);
-        }
-        ParamId::BassSawMix => {
-            let mut p = bass.params().clone();
-            p.saw_mix = value;
-            bass.set_params(p);
-        }
-        ParamId::BassSub => {
-            let mut p = bass.params().clone();
-            p.sub = value;
-            bass.set_params(p);
-        }
-    }
-}
-
-/// Update shared state with a single parameter change
-fn update_state_param(state: &mut SequencerState, param: ParamId, value: f32) {
-    match param {
-        ParamId::KickPitchStart => state.kick_params.pitch_start = value,
-        ParamId::KickPitchEnd => state.kick_params.pitch_end = value,
-        ParamId::KickPitchDecay => state.kick_params.pitch_decay = value,
-        ParamId::KickAmpDecay => state.kick_params.amp_decay = value,
-        ParamId::KickClick => state.kick_params.click = value,
-        ParamId::KickDrive => state.kick_params.drive = value,
-        ParamId::SnareToneFreq => state.snare_params.tone_freq = value,
-        ParamId::SnareToneDecay => state.snare_params.tone_decay = value,
-        ParamId::SnareNoiseDecay => state.snare_params.noise_decay = value,
-        ParamId::SnareToneMix => state.snare_params.tone_mix = value,
-        ParamId::SnareSnappy => state.snare_params.snappy = value,
-        ParamId::HiHatDecay => state.hihat_params.decay = value,
-        ParamId::HiHatTone => state.hihat_params.tone = value,
-        ParamId::HiHatOpen => state.hihat_params.open = value,
-        ParamId::BassFrequency => state.bass_params.frequency = value,
-        ParamId::BassDecay => state.bass_params.decay = value,
-        ParamId::BassSawMix => state.bass_params.saw_mix = value,
-        ParamId::BassSub => state.bass_params.sub = value,
     }
 }
 

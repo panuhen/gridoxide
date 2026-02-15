@@ -1,3 +1,3 @@
 pub mod engine;
 
-pub use engine::{AudioEngine, SequencerState};
+pub use engine::{AudioEngine, SequencerState, TrackState};

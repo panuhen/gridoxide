@@ -1,4 +1,7 @@
+use serde_json::Value;
+
 use super::params::{midi_to_freq, SnareParams, DEFAULT_NOTES};
+use super::source::{ParamDescriptor, SoundSource, SynthType};
 
 /// Snare drum synthesizer
 /// Mix of noise burst and body tone with fast decay
@@ -94,5 +97,56 @@ impl SnareSynth {
         let tone_level = self.params.tone_mix;
 
         (noise * noise_level * 0.6 + tone * tone_level * 0.5) * 0.7
+    }
+}
+
+impl SoundSource for SnareSynth {
+    fn synth_type(&self) -> SynthType { SynthType::Snare }
+    fn type_name(&self) -> &'static str { "SNARE" }
+    fn default_note(&self) -> u8 { DEFAULT_NOTES[1] }
+    fn trigger(&mut self) { self.trigger(); }
+    fn trigger_with_note(&mut self, note: u8) { self.trigger_with_note(note); }
+    fn next_sample(&mut self) -> f32 { self.next_sample() }
+
+    fn param_descriptors(&self) -> Vec<ParamDescriptor> {
+        vec![
+            ParamDescriptor { key: "tone_freq".into(), name: "Tone Freq".into(), min: 120.0, max: 300.0, default: 180.0 },
+            ParamDescriptor { key: "tone_decay".into(), name: "Tone Decay".into(), min: 10.0, max: 40.0, default: 20.0 },
+            ParamDescriptor { key: "noise_decay".into(), name: "Noise Decay".into(), min: 8.0, max: 30.0, default: 15.0 },
+            ParamDescriptor { key: "tone_mix".into(), name: "Tone Mix".into(), min: 0.0, max: 1.0, default: 0.4 },
+            ParamDescriptor { key: "snappy".into(), name: "Snappy".into(), min: 0.0, max: 1.0, default: 0.6 },
+        ]
+    }
+
+    fn get_param(&self, key: &str) -> Option<f32> {
+        match key {
+            "tone_freq" => Some(self.params.tone_freq),
+            "tone_decay" => Some(self.params.tone_decay),
+            "noise_decay" => Some(self.params.noise_decay),
+            "tone_mix" => Some(self.params.tone_mix),
+            "snappy" => Some(self.params.snappy),
+            _ => None,
+        }
+    }
+
+    fn set_param(&mut self, key: &str, value: f32) -> bool {
+        match key {
+            "tone_freq" => { self.params.tone_freq = value; true }
+            "tone_decay" => { self.params.tone_decay = value; true }
+            "noise_decay" => { self.params.noise_decay = value; true }
+            "tone_mix" => { self.params.tone_mix = value; true }
+            "snappy" => { self.params.snappy = value; true }
+            _ => false,
+        }
+    }
+
+    fn serialize_params(&self) -> Value {
+        serde_json::to_value(&self.params).unwrap_or(Value::Null)
+    }
+
+    fn deserialize_params(&mut self, params: &Value) {
+        if let Ok(p) = serde_json::from_value::<SnareParams>(params.clone()) {
+            self.set_params(p);
+        }
     }
 }

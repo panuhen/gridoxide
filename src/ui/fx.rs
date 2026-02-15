@@ -7,7 +7,7 @@ use crate::ui::Theme;
 
 /// State for FX editor view
 pub struct FxEditorState {
-    /// 0-3 for tracks, 4 for master
+    /// 0..N-1 for tracks, N for master (where N = num_tracks)
     pub track: usize,
     /// Selected parameter row index
     pub param_index: usize,
@@ -21,12 +21,17 @@ impl FxEditorState {
         }
     }
 
-    /// Switch to a specific track (0-3) or master (4)
-    pub fn select_track(&mut self, track: usize) {
-        if track <= 4 {
+    /// Switch to a specific track (0..num_tracks-1) or master (num_tracks)
+    pub fn select_track(&mut self, track: usize, num_tracks: usize) {
+        if track <= num_tracks {
             self.track = track;
             self.param_index = 0;
         }
+    }
+
+    /// Whether we're on the master tab
+    pub fn is_master(&self, num_tracks: usize) -> bool {
+        self.track >= num_tracks
     }
 
     /// Move parameter selection up/down
@@ -40,18 +45,13 @@ impl FxEditorState {
 
     /// Total number of selectable parameter rows for current track
     fn param_count(&self) -> usize {
-        if self.track == 4 {
-            // Master: 3 reverb params
-            3
-        } else {
-            // Track: filter(3) + dist(2) + delay(3) = 8
-            // Row layout: FilterType, Cutoff, Resonance, Drive, DistMix, Time, Feedback, DelayMix
-            8
-        }
+        // For master we don't know num_tracks here, but master always has 3 params
+        // and track always has 8 params. The is_master check is done by caller.
+        // We default to 8 here; master callers override to 3.
+        8
     }
 
     /// Get the FX section and local param index for the current selection (track mode)
-    /// Returns (section: 0=filter, 1=dist, 2=delay, param_within_section)
     pub fn current_section_and_param(&self) -> (usize, usize) {
         match self.param_index {
             0..=2 => (0, self.param_index),     // Filter: type(0), cutoff(1), resonance(2)
@@ -70,10 +70,10 @@ impl Default for FxEditorState {
 
 /// Get a track FX parameter value from state
 pub fn get_fx_param_value(state: &SequencerState, track: usize, param: FxParamId) -> f32 {
-    if track >= 4 {
+    if track >= state.tracks.len() {
         return 0.0;
     }
-    let fx = &state.track_fx[track];
+    let fx = &state.tracks[track].fx;
     match param {
         FxParamId::FilterCutoff => fx.filter_cutoff,
         FxParamId::FilterResonance => fx.filter_resonance,
@@ -102,6 +102,8 @@ pub fn render_fx(
     editor: &FxEditorState,
     theme: &Theme,
 ) {
+    let num_tracks = state.tracks.len();
+
     let block = Block::default()
         .title(Span::styled(
             " Effects ",
@@ -122,9 +124,9 @@ pub fn render_fx(
         ])
         .split(inner);
 
-    render_fx_tabs(frame, chunks[0], editor.track, theme);
+    render_fx_tabs(frame, chunks[0], state, editor.track, theme);
 
-    if editor.track == 4 {
+    if editor.is_master(num_tracks) {
         render_master_fx_params(frame, chunks[1], state, editor, theme);
     } else {
         render_track_fx_params(frame, chunks[1], state, editor, theme);
@@ -132,11 +134,11 @@ pub fn render_fx(
 }
 
 /// Render track/master tabs for FX view
-fn render_fx_tabs(frame: &mut Frame, area: Rect, selected: usize, theme: &Theme) {
-    let tabs = ["1:KICK", "2:SNARE", "3:HIHAT", "4:BASS", "5:MASTER"];
-
+fn render_fx_tabs(frame: &mut Frame, area: Rect, state: &SequencerState, selected: usize, theme: &Theme) {
+    let num_tracks = state.tracks.len();
     let mut spans = Vec::new();
-    for (i, name) in tabs.iter().enumerate() {
+    for (i, track) in state.tracks.iter().enumerate() {
+        let label = format!("{}:{}", i + 1, track.name);
         let style = if i == selected {
             Style::default()
                 .fg(theme.bg)
@@ -145,11 +147,20 @@ fn render_fx_tabs(frame: &mut Frame, area: Rect, selected: usize, theme: &Theme)
         } else {
             Style::default().fg(theme.dimmed)
         };
-        spans.push(Span::styled(format!(" {} ", name), style));
-        if i < tabs.len() - 1 {
-            spans.push(Span::styled(" ", Style::default()));
-        }
+        spans.push(Span::styled(format!(" {} ", label), style));
+        spans.push(Span::styled(" ", Style::default()));
     }
+    // Master tab
+    let master_label = format!("{}:MASTER", num_tracks + 1);
+    let master_style = if selected >= num_tracks {
+        Style::default()
+            .fg(theme.bg)
+            .bg(theme.highlight)
+            .bold()
+    } else {
+        Style::default().fg(theme.dimmed)
+    };
+    spans.push(Span::styled(format!(" {} ", master_label), master_style));
 
     let tabs_widget = Paragraph::new(Line::from(spans))
         .style(Style::default().bg(theme.bg))
@@ -167,10 +178,10 @@ fn render_track_fx_params(
     theme: &Theme,
 ) {
     let track = editor.track;
-    if track >= 4 {
+    if track >= state.tracks.len() {
         return;
     }
-    let fx = &state.track_fx[track];
+    let fx = &state.tracks[track].fx;
 
     let mut lines = Vec::new();
     let mut row_idx = 0usize;
@@ -196,8 +207,8 @@ fn render_track_fx_params(
         row_idx == editor.param_index,
         "Type",
         fx.filter_type.name(),
-        0.0, // not used for type display
-        true, // is_type
+        0.0,
+        true,
         theme,
     ));
     row_idx += 1;
