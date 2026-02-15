@@ -1,5 +1,5 @@
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,11 +22,14 @@ use crate::fx::{FilterType, FxParamId, FxType, MasterFxParamId};
 use crate::mcp::{start_socket_server, GridoxideMcp};
 use crate::project;
 use crate::project::renderer::{ExportMode, export_wav};
+use crate::samples;
 use crate::sequencer::{PlaybackMode, NUM_PATTERNS};
+use crate::synth::{load_wav, SynthType};
 use crate::ui::{
-    get_param_descriptors, get_snapshot_param_value, render_fx, render_grid, render_help,
-    render_mixer, render_params, render_song, render_transport, FxEditorState, GridState,
-    HelpState, MixerField, MixerState, ParamEditorState, SongState, Theme, TransportInfo,
+    get_param_descriptors, get_snapshot_param_value, render_browser, render_fx, render_grid,
+    render_help, render_mixer, render_params, render_song, render_transport, BrowserState,
+    FxEditorState, GridState, HelpState, MixerField, MixerState, ParamEditorState, SongState,
+    Theme, TransportInfo,
 };
 use crate::ui::help::help_line_count;
 
@@ -65,6 +68,8 @@ pub struct App {
     song_state: SongState,
     /// Help view state
     help_state: HelpState,
+    /// Sample browser state (modal overlay, None when closed)
+    browser_state: Option<BrowserState>,
     /// Current view
     view: View,
     /// Previous view (for returning from Help)
@@ -77,6 +82,8 @@ pub struct App {
     project_path: Option<PathBuf>,
     /// Temporary status message (e.g., "Saved: project.grox")
     status_message: Option<(String, Instant)>,
+    /// Pending add-track mode: waiting for type selection
+    adding_track: bool,
 }
 
 impl App {
@@ -115,12 +122,14 @@ impl App {
             fx_editor: FxEditorState::new(),
             song_state: SongState::new(),
             help_state: HelpState::new(),
+            browser_state: None,
             view: View::Grid,
             prev_view: View::Grid,
             should_quit: false,
             mcp_shutdown,
             project_path: None,
             status_message: None,
+            adding_track: false,
         })
     }
 
@@ -214,6 +223,18 @@ impl App {
 
     /// Handle key press events
     fn handle_key(&mut self, key: KeyEvent) {
+        // Browser modal intercepts all keys when open
+        if self.browser_state.is_some() {
+            self.handle_browser_key(key.code);
+            return;
+        }
+
+        // Add-track type selection mode
+        if self.adding_track {
+            self.handle_add_track_key(key.code);
+            return;
+        }
+
         // Global Ctrl keybindings (checked before view-specific)
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -279,8 +300,22 @@ impl App {
             .unwrap_or_else(|| PathBuf::from("project.grox"));
         match project::load_project(&path) {
             Ok(project_data) => {
+                // Load sample buffers for sampler tracks
+                let project_dir = path.parent().unwrap_or(Path::new("."));
+                let sample_buffers = project_data.load_sample_buffers(project_dir);
+
                 let new_state = project_data.to_state();
                 self.dispatch(Command::LoadProject(Box::new(new_state)));
+
+                // Send sample buffers to audio thread
+                for sb in sample_buffers {
+                    self.dispatch(Command::LoadSample {
+                        track: sb.track,
+                        buffer: sb.buffer,
+                        path: sb.path,
+                    });
+                }
+
                 let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                 self.set_status(format!("Loaded: {}", name));
                 self.project_path = Some(path);
@@ -317,6 +352,73 @@ impl App {
                 self.set_status(format!("Export failed: {}", e));
             }
         }
+    }
+
+    /// Enter add-track mode — shows type picker in status bar
+    fn add_track_action(&mut self) {
+        let num = self.num_tracks();
+        if num >= 16 {
+            self.set_status("Max 16 tracks".to_string());
+            return;
+        }
+        self.adding_track = true;
+        self.set_status("[1]Kick [2]Snare [3]HiHat [4]Bass [5]Sampler [Esc]Cancel".to_string());
+    }
+
+    /// Handle key in add-track type selection mode
+    fn handle_add_track_key(&mut self, key: KeyCode) {
+        let synth_type = match key {
+            KeyCode::Char('1') => Some(SynthType::Kick),
+            KeyCode::Char('2') => Some(SynthType::Snare),
+            KeyCode::Char('3') => Some(SynthType::HiHat),
+            KeyCode::Char('4') => Some(SynthType::Bass),
+            KeyCode::Char('5') => Some(SynthType::Sampler),
+            KeyCode::Esc => {
+                self.adding_track = false;
+                self.set_status("Cancelled".to_string());
+                return;
+            }
+            _ => None,
+        };
+
+        if let Some(st) = synth_type {
+            self.adding_track = false;
+            let state = self.sequencer_state.read();
+            let count = state.tracks.iter()
+                .filter(|t| t.synth_type == st)
+                .count();
+            drop(state);
+            let name = if count == 0 {
+                st.display_name().to_string()
+            } else {
+                format!("{} {}", st.display_name(), count + 1)
+            };
+            self.dispatch(Command::AddTrack {
+                synth_type: st,
+                name: name.clone(),
+            });
+            self.set_status(format!("Added: {}", name));
+        }
+    }
+
+    /// Remove current track (minimum 1 track must remain)
+    fn remove_track_action(&mut self) {
+        let num_tracks = self.num_tracks();
+        if num_tracks <= 1 {
+            self.set_status("Cannot remove last track".to_string());
+            return;
+        }
+        let track = self.grid_state.cursor_track;
+        let name = {
+            let state = self.sequencer_state.read();
+            state.tracks[track].name.clone()
+        };
+        self.dispatch(Command::RemoveTrack(track));
+        // Adjust cursor if it's now out of bounds
+        if self.grid_state.cursor_track >= num_tracks - 1 {
+            self.grid_state.cursor_track = num_tracks - 2;
+        }
+        self.set_status(format!("Removed: {}", name));
     }
 
     /// Handle keys in grid view
@@ -422,6 +524,21 @@ impl App {
                 self.dispatch(Command::SelectPattern(new_pat));
             }
 
+            // Open sample browser for sampler tracks (Shift+L)
+            KeyCode::Char('L') => {
+                self.open_browser_for_track(self.grid_state.cursor_track);
+            }
+
+            // Add track (Shift+A cycles: sampler, kick, snare, hihat, bass)
+            KeyCode::Char('A') => {
+                self.add_track_action();
+            }
+
+            // Remove current track (Shift+D)
+            KeyCode::Char('D') => {
+                self.remove_track_action();
+            }
+
             _ => {}
         }
     }
@@ -476,6 +593,11 @@ impl App {
             }
             KeyCode::Char(']') => {
                 self.adjust_current_param(0.2);
+            }
+
+            // Open sample browser for sampler tracks (Shift+L)
+            KeyCode::Char('L') => {
+                self.open_browser_for_track(self.param_editor.track);
             }
 
             // Play/Stop still works in params view
@@ -848,6 +970,87 @@ impl App {
         }
     }
 
+    /// Open sample browser for any track
+    fn open_browser_for_track(&mut self, track: usize) {
+        let state = self.sequencer_state.read();
+        if track >= state.tracks.len() {
+            return;
+        }
+        let track_name = state.tracks[track].name.clone();
+        drop(state);
+
+        let dirs = samples::search_dirs();
+        let entries = samples::scan_samples(&dirs);
+        if entries.is_empty() {
+            self.set_status("No samples found in ~/.gridoxide/samples/ or ./samples/".to_string());
+            return;
+        }
+        self.browser_state = Some(BrowserState::new(entries, track, track_name));
+    }
+
+    /// Handle keys in the sample browser modal
+    fn handle_browser_key(&mut self, key: KeyCode) {
+        let browser = match self.browser_state.as_mut() {
+            Some(b) => b,
+            None => return,
+        };
+
+        match key {
+            KeyCode::Esc => {
+                self.browser_state = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                browser.move_up();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                browser.move_down();
+            }
+            KeyCode::Char(' ') => {
+                // Preview selected sample
+                if let Some(entry) = browser.selected_entry() {
+                    let path = entry.path.clone();
+                    let cursor = browser.cursor;
+                    match load_wav(&path, 44100.0) {
+                        Ok(buffer) => {
+                            self.dispatch(Command::PreviewSample(buffer));
+                            if let Some(ref mut b) = self.browser_state {
+                                b.previewing = Some(cursor);
+                            }
+                        }
+                        Err(e) => {
+                            self.set_status(format!("Preview failed: {}", e));
+                        }
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                // Load selected sample into target track
+                if let Some(browser) = self.browser_state.take() {
+                    if let Some(entry) = browser.entries.get(browser.cursor) {
+                        let path = entry.path.clone();
+                        let relative = entry.relative.clone();
+                        let track = browser.target_track;
+                        match load_wav(&path, 44100.0) {
+                            Ok(buffer) => {
+                                let path_str = path.to_string_lossy().to_string();
+                                self.dispatch(Command::LoadSample {
+                                    track,
+                                    buffer,
+                                    path: path_str,
+                                });
+                                self.set_status(format!("Loaded: {}", relative));
+                            }
+                            Err(e) => {
+                                self.set_status(format!("Load failed: {}", e));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Toggle the FX effect that the cursor is currently in
     fn toggle_current_fx(&mut self) {
         let num_tracks = self.num_tracks();
@@ -1105,6 +1308,11 @@ impl App {
         }
 
         self.render_footer(frame, chunks[3]);
+
+        // Render browser overlay on top if active
+        if let Some(ref browser) = self.browser_state {
+            render_browser(frame, chunks[2], browser, &self.theme);
+        }
     }
 
     /// Render the header

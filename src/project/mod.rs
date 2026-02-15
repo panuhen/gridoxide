@@ -1,6 +1,6 @@
 pub mod renderer;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::audio::{SequencerState, TrackState};
 use crate::fx::{MasterFxState, TrackFxState};
 use crate::sequencer::{Arrangement, PatternBank, PlaybackMode};
-use crate::synth::{BassParams, HiHatParams, KickParams, SnareParams, SynthType};
+use crate::synth::{load_wav, BassParams, HiHatParams, KickParams, SnareParams, SynthType};
 
 const PROJECT_VERSION: u32 = 2;
 
@@ -38,6 +38,13 @@ pub struct ProjectData {
     pub current_pattern: usize,
     pub playback_mode: PlaybackMode,
     pub arrangement: Arrangement,
+}
+
+/// Sample buffer loaded for a sampler track during project load
+pub struct SampleBuffer {
+    pub track: usize,
+    pub buffer: Vec<f32>,
+    pub path: String,
 }
 
 /// v1 project data format (for migration from old .grox files)
@@ -164,11 +171,95 @@ impl ProjectData {
             arrangement_repeat: 0,
         }
     }
+
+    /// Convert absolute wav_path fields to relative paths (relative to project dir)
+    fn make_paths_relative(&mut self, project_dir: &Path) {
+        for track in &mut self.tracks {
+            if track.synth_type == SynthType::Sampler {
+                if let Some(wav_path) = track.params.get("wav_path").and_then(|v| v.as_str()) {
+                    let abs = PathBuf::from(wav_path);
+                    if abs.is_absolute() {
+                        // Try to make relative to project dir
+                        if let Ok(rel) = abs.strip_prefix(project_dir) {
+                            track.params["wav_path"] =
+                                Value::String(rel.to_string_lossy().to_string());
+                        }
+                        // Otherwise keep as-is (might be in global samples dir)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Load WAV buffers for all sampler tracks, resolving relative paths against project dir
+    pub fn load_sample_buffers(&self, project_dir: &Path) -> Vec<SampleBuffer> {
+        let mut buffers = Vec::new();
+        for (i, track) in self.tracks.iter().enumerate() {
+            if track.synth_type != SynthType::Sampler {
+                continue;
+            }
+            let wav_path = match track.params.get("wav_path").and_then(|v| v.as_str()) {
+                Some(p) if !p.is_empty() => p,
+                _ => continue,
+            };
+
+            // Resolve path: try relative to project dir first, then absolute, then sample dirs
+            let resolved = resolve_wav_path(wav_path, project_dir);
+            if let Some(full_path) = resolved {
+                match load_wav(&full_path, 44100.0) {
+                    Ok(buffer) => {
+                        buffers.push(SampleBuffer {
+                            track: i,
+                            buffer,
+                            path: full_path.to_string_lossy().to_string(),
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: Failed to load sample for track {}: {} ({})",
+                            i, wav_path, e
+                        );
+                    }
+                }
+            } else {
+                eprintln!(
+                    "Warning: Sample not found for track {}: {}",
+                    i, wav_path
+                );
+            }
+        }
+        buffers
+    }
+}
+
+/// Resolve a wav path from a project file
+fn resolve_wav_path(wav_path: &str, project_dir: &Path) -> Option<PathBuf> {
+    let as_path = PathBuf::from(wav_path);
+
+    // If absolute and exists, use it
+    if as_path.is_absolute() && as_path.exists() {
+        return Some(as_path);
+    }
+
+    // Try relative to project directory
+    let relative_to_project = project_dir.join(wav_path);
+    if relative_to_project.exists() {
+        return Some(relative_to_project);
+    }
+
+    // Try sample directories
+    let dirs = crate::samples::search_dirs();
+    crate::samples::resolve_sample_path(wav_path, &dirs)
 }
 
 /// Save the current sequencer state to a .grox JSON file
 pub fn save_project(state: &SequencerState, path: &Path) -> Result<()> {
-    let project = ProjectData::from_state(state);
+    let mut project = ProjectData::from_state(state);
+    // Convert absolute WAV paths to relative
+    if let Some(project_dir) = path.parent() {
+        let abs_dir = std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+        project.make_paths_relative(&abs_dir);
+    }
     let json = serde_json::to_string_pretty(&project)
         .context("Failed to serialize project")?;
     std::fs::write(path, json)

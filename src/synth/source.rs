@@ -4,6 +4,7 @@ use serde_json::Value;
 use super::bass::BassSynth;
 use super::hihat::HiHatSynth;
 use super::kick::KickSynth;
+use super::sampler::SamplerSynth;
 use super::snare::SnareSynth;
 
 /// Identifies the type of synthesizer
@@ -94,6 +95,9 @@ pub trait SoundSource: Send {
 
     /// Deserialize parameters from JSON
     fn deserialize_params(&mut self, params: &Value);
+
+    /// Load a sample buffer into this synth (only used by SamplerSynth, no-op for others)
+    fn load_buffer(&mut self, _buffer: Vec<f32>, _path: &str) {}
 }
 
 /// Factory function: create a synth from its type, sample rate, and optional saved params
@@ -107,10 +111,7 @@ pub fn create_synth(
         SynthType::Snare => Box::new(SnareSynth::new(sample_rate)),
         SynthType::HiHat => Box::new(HiHatSynth::new(sample_rate)),
         SynthType::Bass => Box::new(BassSynth::new(sample_rate)),
-        SynthType::Sampler => {
-            // Placeholder: create a silent synth until Phase 8b
-            Box::new(KickSynth::new(sample_rate))
-        }
+        SynthType::Sampler => Box::new(SamplerSynth::new(sample_rate)),
     };
     if let Some(params) = params_json {
         synth.deserialize_params(params);

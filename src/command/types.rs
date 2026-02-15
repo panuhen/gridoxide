@@ -67,12 +67,21 @@ pub enum Command {
     // Project I/O
     #[serde(skip)]
     LoadProject(Box<SequencerState>),
+
+    // Sample loading
+    #[serde(skip)]
+    LoadSample { track: usize, buffer: Vec<f32>, path: String },
+    #[serde(skip)]
+    PreviewSample(Vec<f32>),
 }
 
 impl Command {
     /// Returns true if this command should be logged to event log
     pub fn is_loggable(&self) -> bool {
-        !matches!(self, Command::LoadProject(_))
+        !matches!(
+            self,
+            Command::LoadProject(_) | Command::LoadSample { .. } | Command::PreviewSample(_)
+        )
     }
 
     /// Human-readable description of the command
@@ -158,6 +167,10 @@ impl Command {
             }
             Command::ClearArrangement => "Clear arrangement".to_string(),
             Command::LoadProject(_) => "Load project".to_string(),
+            Command::LoadSample { track, ref path, .. } => {
+                format!("Load sample '{}' into track {}", path, track)
+            }
+            Command::PreviewSample(_) => "Preview sample".to_string(),
         }
     }
 }

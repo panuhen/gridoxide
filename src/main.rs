@@ -7,6 +7,7 @@ mod event;
 mod fx;
 mod mcp;
 mod project;
+mod samples;
 mod sequencer;
 mod synth;
 mod ui;
@@ -67,6 +68,9 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+
+    // Ensure sample directories exist
+    samples::ensure_samples_dir();
 
     // Load theme
     let theme = Theme::from_name(&args.theme).unwrap_or_else(|| {

@@ -199,6 +199,10 @@ impl AudioEngine {
         let mut reverb = StereoReverb::new(sample_rate);
         let mut reverb_enabled = false;
 
+        // Preview sample buffer (one-shot playback through master bus)
+        let mut preview_buffer: Option<Vec<f32>> = None;
+        let mut preview_pos: usize = 0;
+
         // For periodic state sync
         let mut sync_counter = 0usize;
         let sync_interval = (sample_rate / 60.0) as usize; // ~60 times per second
@@ -554,6 +558,27 @@ impl AudioEngine {
                             }
                         }
 
+                        Command::LoadSample { track, buffer, ref path } => {
+                            if track < synths.len() {
+                                // Convert non-sampler tracks to sampler
+                                if synths[track].synth_type() != SynthType::Sampler {
+                                    synths[track] = create_synth(SynthType::Sampler, sample_rate, None);
+                                    if let Some(mut state) = state.try_write() {
+                                        state.tracks[track].synth_type = SynthType::Sampler;
+                                    }
+                                }
+                                synths[track].load_buffer(buffer, path);
+                                if let Some(mut state) = state.try_write() {
+                                    state.tracks[track].params_snapshot = synths[track].serialize_params();
+                                }
+                            }
+                        }
+
+                        Command::PreviewSample(buffer) => {
+                            preview_buffer = Some(buffer);
+                            preview_pos = 0;
+                        }
+
                         Command::LoadProject(new_state) => {
                             // Stop playback
                             clock.stop();
@@ -692,6 +717,19 @@ impl AudioEngine {
                         let angle = (local_pans[i] + 1.0) * 0.25 * std::f32::consts::PI;
                         left += s * angle.cos();
                         right += s * angle.sin();
+                    }
+
+                    // Preview sample (one-shot, no FX, straight to mix)
+                    if let Some(ref buf) = preview_buffer {
+                        if preview_pos < buf.len() {
+                            let preview_sample = buf[preview_pos] * 0.8;
+                            left += preview_sample;
+                            right += preview_sample;
+                            preview_pos += 1;
+                        } else {
+                            preview_buffer = None;
+                            preview_pos = 0;
+                        }
                     }
 
                     // Master reverb

@@ -10,8 +10,9 @@ use crate::event::EventLog;
 use crate::fx::{FilterType, FxParamId, FxType, MasterFxParamId};
 use crate::project;
 use crate::project::renderer::{ExportMode, export_wav};
+use crate::samples;
 use crate::sequencer::{PlaybackMode, NUM_PATTERNS};
-use crate::synth::{create_synth, note_name, ParamDescriptor, SynthType};
+use crate::synth::{create_synth, load_wav, note_name, ParamDescriptor, SynthType};
 
 /// MCP server handler for gridoxide
 pub struct GridoxideMcp {
@@ -475,7 +476,7 @@ impl GridoxideMcp {
             None => {
                 return json!({
                     "status": "error",
-                    "message": format!("Unknown synth type: '{}'. Valid: kick, snare, hihat, bass", synth_type_str)
+                    "message": format!("Unknown synth type: '{}'. Valid: kick, snare, hihat, bass, sampler", synth_type_str)
                 });
             }
         };
@@ -979,8 +980,22 @@ impl GridoxideMcp {
         let path = Path::new(path_str);
         match project::load_project(path) {
             Ok(project_data) => {
+                // Load sample buffers for sampler tracks
+                let project_dir = path.parent().unwrap_or(Path::new("."));
+                let sample_buffers = project_data.load_sample_buffers(project_dir);
+
                 let new_state = project_data.to_state();
                 self.dispatch(Command::LoadProject(Box::new(new_state)));
+
+                // Send sample buffers to audio thread
+                for sb in sample_buffers {
+                    self.dispatch(Command::LoadSample {
+                        track: sb.track,
+                        buffer: sb.buffer,
+                        path: sb.path,
+                    });
+                }
+
                 json!({
                     "status": "ok",
                     "path": path_str,
@@ -1071,6 +1086,127 @@ impl GridoxideMcp {
     }
 
     /// Handle an MCP tool call
+    // === Sample Tools ===
+
+    pub fn load_sample(&self, track: usize, path_str: &str) -> Value {
+        if let Some(err) = self.validate_track(track) {
+            return err;
+        }
+
+        // Check track is a sampler
+        let state = self.sequencer_state.read();
+        if track >= state.tracks.len() || state.tracks[track].synth_type != SynthType::Sampler {
+            return json!({
+                "status": "error",
+                "message": format!("Track {} is not a sampler track", track)
+            });
+        }
+        drop(state);
+
+        // Resolve path
+        let dirs = samples::search_dirs();
+        let resolved = samples::resolve_sample_path(path_str, &dirs);
+        let full_path = match resolved {
+            Some(p) => p,
+            None => {
+                return json!({
+                    "status": "error",
+                    "message": format!("Sample not found: '{}'. Searched in {:?}", path_str, dirs)
+                });
+            }
+        };
+
+        // Load WAV
+        match load_wav(&full_path, 44100.0) {
+            Ok(buffer) => {
+                let sample_count = buffer.len();
+                let duration_secs = sample_count as f32 / 44100.0;
+                let path_string = full_path.to_string_lossy().to_string();
+                self.dispatch(Command::LoadSample {
+                    track,
+                    buffer,
+                    path: path_string.clone(),
+                });
+                json!({
+                    "status": "ok",
+                    "track": track,
+                    "path": path_string,
+                    "samples": sample_count,
+                    "duration_secs": duration_secs,
+                    "message": format!("Loaded sample into track {}", track)
+                })
+            }
+            Err(e) => json!({
+                "status": "error",
+                "message": format!("Failed to load WAV: {}", e)
+            }),
+        }
+    }
+
+    pub fn preview_sample(&self, path_str: &str) -> Value {
+        let dirs = samples::search_dirs();
+        let resolved = samples::resolve_sample_path(path_str, &dirs);
+        let full_path = match resolved {
+            Some(p) => p,
+            None => {
+                return json!({
+                    "status": "error",
+                    "message": format!("Sample not found: '{}'. Searched in {:?}", path_str, dirs)
+                });
+            }
+        };
+
+        match load_wav(&full_path, 44100.0) {
+            Ok(buffer) => {
+                let duration_secs = buffer.len() as f32 / 44100.0;
+                let path_string = full_path.to_string_lossy().to_string();
+                self.dispatch(Command::PreviewSample(buffer));
+                json!({
+                    "status": "ok",
+                    "path": path_string,
+                    "duration_secs": duration_secs,
+                    "message": format!("Previewing sample ({:.1}s)", duration_secs)
+                })
+            }
+            Err(e) => json!({
+                "status": "error",
+                "message": format!("Failed to load WAV: {}", e)
+            }),
+        }
+    }
+
+    pub fn list_samples(&self, directory: Option<&str>) -> Value {
+        let dirs = samples::search_dirs();
+        let entries = samples::scan_samples(&dirs);
+
+        let filtered: Vec<&samples::SampleEntry> = if let Some(dir_filter) = directory {
+            entries
+                .iter()
+                .filter(|e| e.dir.eq_ignore_ascii_case(dir_filter))
+                .collect()
+        } else {
+            entries.iter().collect()
+        };
+
+        let sample_list: Vec<Value> = filtered
+            .iter()
+            .map(|e| {
+                json!({
+                    "path": e.relative,
+                    "name": e.name,
+                    "dir": e.dir
+                })
+            })
+            .collect();
+
+        json!({
+            "status": "ok",
+            "samples": sample_list,
+            "count": sample_list.len(),
+            "search_dirs": dirs.iter().map(|d| d.to_string_lossy().to_string()).collect::<Vec<_>>()
+        })
+    }
+
     pub fn handle_tool_call(&self, tool: &str, args: &Value) -> Value {
         match tool {
             // Transport
@@ -1263,6 +1399,21 @@ impl GridoxideMcp {
                 self.list_projects(directory)
             }
 
+            // Sample tools
+            "load_sample" => {
+                let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                self.load_sample(track, path)
+            }
+            "preview_sample" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                self.preview_sample(path)
+            }
+            "list_samples" => {
+                let directory = args.get("directory").and_then(|v| v.as_str());
+                self.list_samples(directory)
+            }
+
             _ => json!({ "status": "error", "message": format!("Unknown tool: {}", tool) }),
         }
     }
@@ -1423,7 +1574,7 @@ impl GridoxideMcp {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "synth_type": { "type": "string", "description": "Synth type: 'kick', 'snare', 'hihat', or 'bass'" },
+                            "synth_type": { "type": "string", "description": "Synth type: 'kick', 'snare', 'hihat', 'bass', or 'sampler'" },
                             "name": { "type": "string", "description": "Display name for the track" }
                         },
                         "required": ["synth_type", "name"]
@@ -1679,6 +1830,39 @@ impl GridoxideMcp {
                     "inputSchema": {
                         "type": "object",
                         "properties": { "directory": { "type": "string", "description": "Directory to search (defaults to current directory)" } }
+                    }
+                },
+                {
+                    "name": "load_sample",
+                    "description": "Load a WAV sample into a sampler track. Searches project-local ./samples/ then ~/.gridoxide/samples/, or accepts absolute paths.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "track": { "type": "integer", "description": "Track index (0-based, must be a sampler track)" },
+                            "path": { "type": "string", "description": "Sample path (relative to sample dirs or absolute)" }
+                        },
+                        "required": ["track", "path"]
+                    }
+                },
+                {
+                    "name": "preview_sample",
+                    "description": "Preview/audition a WAV sample through the master bus without loading it into a track.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Sample path (relative to sample dirs or absolute)" }
+                        },
+                        "required": ["path"]
+                    }
+                },
+                {
+                    "name": "list_samples",
+                    "description": "List available WAV samples from sample directories (~/.gridoxide/samples/ and ./samples/).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "directory": { "type": "string", "description": "Optional directory filter (e.g., 'kicks', 'snares')" }
+                        }
                     }
                 }
             ]

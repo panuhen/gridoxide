@@ -4,8 +4,9 @@ use anyhow::{Context, Result};
 
 use crate::audio::SequencerState;
 use crate::fx::{configure_fx_chain, StereoReverb, TrackFxChain};
+use crate::samples;
 use crate::sequencer::{Clock, STEPS};
-use crate::synth::{create_synth, SoundSource};
+use crate::synth::{create_synth, load_wav, SoundSource, SynthType};
 
 const SAMPLE_RATE: f32 = 44100.0;
 const TAIL_SECONDS: f32 = 1.0;
@@ -47,7 +48,28 @@ impl OfflineRenderer {
         let mut fx_chains = Vec::with_capacity(state.tracks.len());
 
         for track in &state.tracks {
-            let synth = create_synth(track.synth_type, SAMPLE_RATE, Some(&track.params_snapshot));
+            let mut synth = create_synth(track.synth_type, SAMPLE_RATE, Some(&track.params_snapshot));
+            // Load sample buffer for sampler tracks
+            if track.synth_type == SynthType::Sampler {
+                if let Some(wav_path) = track.params_snapshot.get("wav_path").and_then(|v| v.as_str()) {
+                    if !wav_path.is_empty() {
+                        // Try absolute, then sample dirs
+                        let path = std::path::PathBuf::from(wav_path);
+                        let resolved = if path.exists() {
+                            Some(path)
+                        } else {
+                            let dirs = samples::search_dirs();
+                            samples::resolve_sample_path(wav_path, &dirs)
+                        };
+                        if let Some(full_path) = resolved {
+                            if let Ok(buffer) = load_wav(&full_path, SAMPLE_RATE) {
+                                let path_str = full_path.to_string_lossy().to_string();
+                                synth.load_buffer(buffer, &path_str);
+                            }
+                        }
+                    }
+                }
+            }
             synths.push(synth);
             volumes.push(track.volume);
             pans.push(track.pan);

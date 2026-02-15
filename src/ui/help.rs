@@ -134,6 +134,9 @@ fn build_help_lines(theme: &Theme) -> Vec<Line<'static>> {
     add_key(&mut lines, "  C         ", "Clear current track", key_style, desc_style);
     add_key(&mut lines, "  F         ", "Fill current track", key_style, desc_style);
     add_key(&mut lines, "  , / .     ", "Previous / next pattern", key_style, desc_style);
+    add_key(&mut lines, "  Shift+L   ", "Open sample browser", key_style, desc_style);
+    add_key(&mut lines, "  Shift+A   ", "Add track (pick type: 1-5)", key_style, desc_style);
+    add_key(&mut lines, "  Shift+D   ", "Remove current track", key_style, desc_style);
     lines.push(Line::from(""));
 
     // Params
@@ -146,6 +149,19 @@ fn build_help_lines(theme: &Theme) -> Vec<Line<'static>> {
     add_key(&mut lines, "  Up/Down   ", "Select parameter", key_style, desc_style);
     add_key(&mut lines, "  Left/Right", "Adjust value (fine)", key_style, desc_style);
     add_key(&mut lines, "  [ / ]     ", "Adjust value (coarse)", key_style, desc_style);
+    add_key(&mut lines, "  Shift+L   ", "Open sample browser", key_style, desc_style);
+    lines.push(Line::from(""));
+
+    // Sample Browser
+    lines.push(Line::from(Span::styled("  SAMPLE BROWSER", header_style)));
+    lines.push(Line::from(Span::styled(
+        "  ──────────────────────────────────────",
+        dim_style,
+    )));
+    add_key(&mut lines, "  Up/Down   ", "Navigate files (skip folder headers)", key_style, desc_style);
+    add_key(&mut lines, "  Space     ", "Preview/audition selected sample", key_style, desc_style);
+    add_key(&mut lines, "  Enter     ", "Load sample into track", key_style, desc_style);
+    add_key(&mut lines, "  Esc       ", "Cancel and close browser", key_style, desc_style);
     lines.push(Line::from(""));
 
     // Mixer

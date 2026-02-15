@@ -1,6 +1,6 @@
 [package]
 name = "gridoxide"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 description = "Terminal EDM Production Studio - A Rust-based step sequencer and synthesizer"
 license = "MIT"
