@@ -515,6 +515,13 @@ impl SoundSource for SamplerSynth {
             }
         }
     }
+
+    fn stop(&mut self) {
+        self.position = None;
+        self.envelope = 0.0;
+        self.envelope_phase = EnvelopePhase::Off;
+        self.envelope_samples = 0;
+    }
 }
 
 /// Load a WAV file and return mono f32 samples at the target sample rate

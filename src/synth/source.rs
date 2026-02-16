@@ -101,6 +101,9 @@ pub trait SoundSource: Send {
 
     /// Called on each sequencer step tick. Used by samplers for hold_steps countdown.
     fn step_tick(&mut self) {}
+
+    /// Stop/silence this synth immediately. Used when transport stops.
+    fn stop(&mut self) {}
 }
 
 /// Factory function: create a synth from its type, sample rate, and optional saved params

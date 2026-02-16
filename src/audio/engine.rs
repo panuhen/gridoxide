@@ -229,6 +229,10 @@ impl AudioEngine {
                         }
                         Command::Stop => {
                             clock.stop();
+                            // Silence all synths immediately
+                            for synth in synths.iter_mut() {
+                                synth.stop();
+                            }
                             // Apply any pending pattern switch immediately on stop
                             if let Some(new_pat) = pending_pattern_switch.take() {
                                 local_pattern_bank.get_mut(local_current_pattern).steps = pattern.steps.clone();
