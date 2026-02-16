@@ -98,6 +98,9 @@ pub trait SoundSource: Send {
 
     /// Load a sample buffer into this synth (only used by SamplerSynth, no-op for others)
     fn load_buffer(&mut self, _buffer: Vec<f32>, _path: &str) {}
+
+    /// Called on each sequencer step tick. Used by samplers for hold_steps countdown.
+    fn step_tick(&mut self) {}
 }
 
 /// Factory function: create a synth from its type, sample rate, and optional saved params

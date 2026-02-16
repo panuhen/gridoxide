@@ -11,12 +11,30 @@ use super::source::{ParamDescriptor, SoundSource, SynthType};
 pub struct SamplerParams {
     pub amplitude: f32,    // 0.0-1.0, default 0.8
     pub attack: f32,       // 0-50 ms, default 0
-    pub decay: f32,        // 10-2000 ms, default 500
+    pub decay: f32,        // 10-500 ms, time to reach sustain level, default 100
+    pub sustain: f32,      // 0.0-1.0, sustain level, default 0.8
+    pub release: f32,      // 10-2000 ms, release time, default 200
     pub start_point: f32,  // 0.0-1.0 (fraction of buffer), default 0.0
     pub end_point: f32,    // 0.0-1.0 (fraction of buffer), default 1.0
     pub pitch_shift: f32,  // -24 to +24 semitones, default 0
     #[serde(default)]
+    pub loop_enabled: bool, // default false (one-shot)
+    #[serde(default = "default_loop_end")]
+    pub loop_start: f32,   // 0.0-1.0, default 0.0
+    #[serde(default = "default_loop_end")]
+    pub loop_end: f32,     // 0.0-1.0, default 1.0
+    #[serde(default = "default_hold_steps")]
+    pub hold_steps: u8,    // 1-16, default 4
+    #[serde(default)]
     pub wav_path: Option<String>, // for display and serialization
+}
+
+fn default_loop_end() -> f32 {
+    1.0
+}
+
+fn default_hold_steps() -> u8 {
+    4
 }
 
 impl Default for SamplerParams {
@@ -24,10 +42,16 @@ impl Default for SamplerParams {
         Self {
             amplitude: 0.8,
             attack: 0.0,
-            decay: 500.0,
+            decay: 100.0,
+            sustain: 0.8,
+            release: 200.0,
             start_point: 0.0,
             end_point: 1.0,
             pitch_shift: 0.0,
+            loop_enabled: false,
+            loop_start: 0.0,
+            loop_end: 1.0,
+            hold_steps: 4,
             wav_path: None,
         }
     }
@@ -36,9 +60,10 @@ impl Default for SamplerParams {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum EnvelopePhase {
     Off,
-    Attack,
-    Sustain,
-    Decay,
+    Attack,  // 0 → 1.0 over attack time
+    Decay,   // 1.0 → sustain level over decay time
+    Sustain, // Hold at sustain level (loop continues)
+    Release, // sustain → 0 over release time (triggered by note_off or hold_steps)
 }
 
 /// Sampler synth: plays back a WAV buffer with pitch shifting
@@ -50,6 +75,9 @@ pub struct SamplerSynth {
     envelope: f32,              // current envelope value (0.0-1.0)
     envelope_phase: EnvelopePhase,
     envelope_samples: usize,    // samples elapsed in current phase
+    release_start_level: f32,   // envelope level when release started
+    trigger_step: Option<usize>, // step when note was triggered (for hold_steps)
+    steps_elapsed: usize,        // steps elapsed since trigger
     params: SamplerParams,
 }
 
@@ -63,6 +91,9 @@ impl SamplerSynth {
             envelope: 0.0,
             envelope_phase: EnvelopePhase::Off,
             envelope_samples: 0,
+            release_start_level: 0.0,
+            trigger_step: None,
+            steps_elapsed: 0,
             params: SamplerParams::default(),
         }
     }
@@ -87,6 +118,27 @@ impl SamplerSynth {
 
     fn decay_samples(&self) -> f32 {
         self.params.decay * 0.001 * self.sample_rate // ms to samples
+    }
+
+    fn release_samples(&self) -> f32 {
+        self.params.release * 0.001 * self.sample_rate // ms to samples
+    }
+
+    fn loop_start_samples(&self) -> f64 {
+        self.params.loop_start as f64 * self.buffer.len() as f64
+    }
+
+    fn loop_end_samples(&self) -> f64 {
+        self.params.loop_end as f64 * self.buffer.len() as f64
+    }
+
+    /// Trigger release phase (called by hold_steps countdown or note_off)
+    fn start_release(&mut self) {
+        if self.envelope_phase != EnvelopePhase::Off && self.envelope_phase != EnvelopePhase::Release {
+            self.release_start_level = self.envelope;
+            self.envelope_phase = EnvelopePhase::Release;
+            self.envelope_samples = 0;
+        }
     }
 }
 
@@ -117,11 +169,20 @@ impl SoundSource for SamplerSynth {
         self.position = Some(self.start_pos_samples());
         self.envelope = 0.0;
         self.envelope_samples = 0;
+        self.release_start_level = 0.0;
+        self.steps_elapsed = 0;
+        self.trigger_step = Some(0); // Will be set properly by step_tick
         if self.params.attack > 0.0 {
             self.envelope_phase = EnvelopePhase::Attack;
         } else {
+            // Skip attack, go straight to peak (1.0) then decay
             self.envelope = 1.0;
-            self.envelope_phase = EnvelopePhase::Sustain;
+            if self.params.decay > 0.0 {
+                self.envelope_phase = EnvelopePhase::Decay;
+            } else {
+                self.envelope = self.params.sustain;
+                self.envelope_phase = EnvelopePhase::Sustain;
+            }
         }
     }
 
@@ -137,16 +198,34 @@ impl SoundSource for SamplerSynth {
 
         let end = self.end_pos_samples();
 
-        // Check if we've reached end
-        if pos >= end || pos >= self.buffer.len() as f64 {
-            self.position = None;
-            self.envelope_phase = EnvelopePhase::Off;
-            return 0.0;
-        }
+        // Check if we've reached end of playback region
+        let new_pos = if pos >= end || pos >= self.buffer.len() as f64 {
+            if self.params.loop_enabled && self.envelope_phase != EnvelopePhase::Release {
+                // Loop mode: wrap back to loop_start
+                let loop_start = self.loop_start_samples();
+                let loop_end = self.loop_end_samples().min(self.buffer.len() as f64);
+                if loop_end > loop_start {
+                    // Wrap within loop region
+                    loop_start + ((pos - loop_start) % (loop_end - loop_start))
+                } else {
+                    // Invalid loop region, stop
+                    self.position = None;
+                    self.envelope_phase = EnvelopePhase::Off;
+                    return 0.0;
+                }
+            } else {
+                // One-shot mode or in release: stop playback
+                self.position = None;
+                self.envelope_phase = EnvelopePhase::Off;
+                return 0.0;
+            }
+        } else {
+            pos
+        };
 
         // Linear interpolation
-        let idx = pos as usize;
-        let frac = (pos - idx as f64) as f32;
+        let idx = new_pos as usize;
+        let frac = (new_pos - idx as f64) as f32;
         let s0 = if idx < self.buffer.len() {
             self.buffer[idx]
         } else {
@@ -159,8 +238,19 @@ impl SoundSource for SamplerSynth {
         };
         let raw = s0 + (s1 - s0) * frac;
 
-        // Advance position
-        self.position = Some(pos + self.playback_rate);
+        // Advance position (with loop wrapping)
+        let next_pos = new_pos + self.playback_rate;
+        if self.params.loop_enabled && self.envelope_phase != EnvelopePhase::Release {
+            let loop_start = self.loop_start_samples();
+            let loop_end = self.loop_end_samples().min(self.buffer.len() as f64);
+            if loop_end > loop_start && next_pos >= loop_end {
+                self.position = Some(loop_start + ((next_pos - loop_start) % (loop_end - loop_start)));
+            } else {
+                self.position = Some(next_pos);
+            }
+        } else {
+            self.position = Some(next_pos);
+        }
 
         // Update envelope
         self.envelope_samples += 1;
@@ -174,30 +264,62 @@ impl SoundSource for SamplerSynth {
                     self.envelope = (self.envelope_samples as f32 / attack_len).min(1.0);
                     if self.envelope >= 1.0 {
                         self.envelope = 1.0;
-                        self.envelope_phase = EnvelopePhase::Sustain;
+                        self.envelope_phase = EnvelopePhase::Decay;
                         self.envelope_samples = 0;
                     }
                 } else {
                     self.envelope = 1.0;
+                    self.envelope_phase = EnvelopePhase::Decay;
+                    self.envelope_samples = 0;
+                }
+            }
+            EnvelopePhase::Decay => {
+                let decay_len = self.decay_samples();
+                let sustain_level = self.params.sustain;
+                if decay_len > 0.0 {
+                    let progress = (self.envelope_samples as f32 / decay_len).min(1.0);
+                    self.envelope = 1.0 - progress * (1.0 - sustain_level);
+                    if progress >= 1.0 {
+                        self.envelope = sustain_level;
+                        self.envelope_phase = EnvelopePhase::Sustain;
+                        self.envelope_samples = 0;
+                    }
+                } else {
+                    self.envelope = sustain_level;
                     self.envelope_phase = EnvelopePhase::Sustain;
                     self.envelope_samples = 0;
                 }
             }
             EnvelopePhase::Sustain => {
-                // Start decay immediately (one-shot samples)
-                self.envelope_phase = EnvelopePhase::Decay;
-                self.envelope_samples = 0;
+                // Hold at sustain level
+                // For one-shot (non-looping), auto-trigger release when near end
+                if !self.params.loop_enabled {
+                    let end = self.end_pos_samples();
+                    let release_time_samples = self.release_samples() as f64 * self.playback_rate;
+                    if let Some(p) = self.position {
+                        if p + release_time_samples >= end {
+                            self.start_release();
+                        }
+                    }
+                }
+                // Hold_steps countdown is handled by step_tick()
             }
-            EnvelopePhase::Decay => {
-                let decay_len = self.decay_samples();
-                if decay_len > 0.0 {
-                    self.envelope = 1.0 - (self.envelope_samples as f32 / decay_len).min(1.0);
-                    if self.envelope <= 0.0 {
+            EnvelopePhase::Release => {
+                let release_len = self.release_samples();
+                if release_len > 0.0 {
+                    let progress = (self.envelope_samples as f32 / release_len).min(1.0);
+                    self.envelope = self.release_start_level * (1.0 - progress);
+                    if progress >= 1.0 {
                         self.envelope = 0.0;
                         self.position = None;
                         self.envelope_phase = EnvelopePhase::Off;
                         return 0.0;
                     }
+                } else {
+                    self.envelope = 0.0;
+                    self.position = None;
+                    self.envelope_phase = EnvelopePhase::Off;
+                    return 0.0;
                 }
             }
         }
@@ -225,8 +347,22 @@ impl SoundSource for SamplerSynth {
                 key: "decay".into(),
                 name: "Decay (ms)".into(),
                 min: 10.0,
+                max: 500.0,
+                default: 100.0,
+            },
+            ParamDescriptor {
+                key: "sustain".into(),
+                name: "Sustain".into(),
+                min: 0.0,
+                max: 1.0,
+                default: 0.8,
+            },
+            ParamDescriptor {
+                key: "release".into(),
+                name: "Release (ms)".into(),
+                min: 10.0,
                 max: 2000.0,
-                default: 500.0,
+                default: 200.0,
             },
             ParamDescriptor {
                 key: "start_point".into(),
@@ -249,6 +385,34 @@ impl SoundSource for SamplerSynth {
                 max: 24.0,
                 default: 0.0,
             },
+            ParamDescriptor {
+                key: "loop_enabled".into(),
+                name: "Loop".into(),
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+            },
+            ParamDescriptor {
+                key: "loop_start".into(),
+                name: "Loop Start".into(),
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+            },
+            ParamDescriptor {
+                key: "loop_end".into(),
+                name: "Loop End".into(),
+                min: 0.0,
+                max: 1.0,
+                default: 1.0,
+            },
+            ParamDescriptor {
+                key: "hold_steps".into(),
+                name: "Hold Steps".into(),
+                min: 1.0,
+                max: 16.0,
+                default: 4.0,
+            },
         ]
     }
 
@@ -257,9 +421,15 @@ impl SoundSource for SamplerSynth {
             "amplitude" => Some(self.params.amplitude),
             "attack" => Some(self.params.attack),
             "decay" => Some(self.params.decay),
+            "sustain" => Some(self.params.sustain),
+            "release" => Some(self.params.release),
             "start_point" => Some(self.params.start_point),
             "end_point" => Some(self.params.end_point),
             "pitch_shift" => Some(self.params.pitch_shift),
+            "loop_enabled" => Some(if self.params.loop_enabled { 1.0 } else { 0.0 }),
+            "loop_start" => Some(self.params.loop_start),
+            "loop_end" => Some(self.params.loop_end),
+            "hold_steps" => Some(self.params.hold_steps as f32),
             _ => None,
         }
     }
@@ -275,7 +445,15 @@ impl SoundSource for SamplerSynth {
                 true
             }
             "decay" => {
-                self.params.decay = value.clamp(10.0, 2000.0);
+                self.params.decay = value.clamp(10.0, 500.0);
+                true
+            }
+            "sustain" => {
+                self.params.sustain = value.clamp(0.0, 1.0);
+                true
+            }
+            "release" => {
+                self.params.release = value.clamp(10.0, 2000.0);
                 true
             }
             "start_point" => {
@@ -288,6 +466,22 @@ impl SoundSource for SamplerSynth {
             }
             "pitch_shift" => {
                 self.params.pitch_shift = value.clamp(-24.0, 24.0);
+                true
+            }
+            "loop_enabled" => {
+                self.params.loop_enabled = value >= 0.5;
+                true
+            }
+            "loop_start" => {
+                self.params.loop_start = value.clamp(0.0, 1.0);
+                true
+            }
+            "loop_end" => {
+                self.params.loop_end = value.clamp(0.0, 1.0);
+                true
+            }
+            "hold_steps" => {
+                self.params.hold_steps = (value.clamp(1.0, 16.0) as u8).max(1);
                 true
             }
             _ => false,
@@ -306,6 +500,20 @@ impl SoundSource for SamplerSynth {
 
     fn load_buffer(&mut self, buffer: Vec<f32>, path: &str) {
         self.set_buffer(buffer, path);
+    }
+
+    fn step_tick(&mut self) {
+        // Only count steps if we're playing and in attack/decay/sustain phase
+        if self.position.is_some()
+            && self.envelope_phase != EnvelopePhase::Off
+            && self.envelope_phase != EnvelopePhase::Release
+        {
+            self.steps_elapsed += 1;
+            // Check hold_steps countdown
+            if self.steps_elapsed >= self.params.hold_steps as usize {
+                self.start_release();
+            }
+        }
     }
 }
 

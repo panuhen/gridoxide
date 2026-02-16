@@ -8,22 +8,22 @@ Gridoxide is a terminal EDM production studio designed for collaborative use bet
 
 When the TUI is running, an MCP socket bridge at `/tmp/gridoxide.sock` allows Claude to control the same session in real time - changes from MCP appear live in the grid.
 
-## Current Status: Phase 5
+## Current Status: v0.8.2 (Phase 8c)
 
-- 4 tracks: Kick, Snare, Hi-hat, Bass
+- **Dynamic tracks**: Add/remove tracks at runtime (kick, snare, hihat, bass, sampler)
+- **Sampler synth**: WAV sample loading with pitch shifting, ADSR envelope, loop mode
+- **ADSR envelope**: Attack, Decay, Sustain level, Release for samplers
+- **Loop mode**: Configurable loop start/end points, hold_steps for sustained playback
+- **16-slot pattern bank**: Copy, clear, switch patterns
+- **Song mode**: Arrangement with pattern chaining and repeat counts
+- **Project I/O**: Save/load .grox JSON files, export WAV audio
+- **Sample browser**: TUI overlay for browsing and loading WAV files
 - 16-step pattern grid with per-step MIDI notes (0-127)
-- Melodic bass lines, tuned kicks, pitched snares, brightness-varied hihats
-- Grid view with note names on active steps
-- Parameter editor (Params view)
-- Mixer with volume, pan, mute/solo (Mixer view)
 - Per-track FX chains: filter (LP/HP/BP), distortion (tanh), delay (ring buffer)
 - Master bus reverb (Schroeder)
-- FX view for real-time effect tweaking
 - Signal chain: Synth → [Filter → Distortion → Delay] → Volume → Pan → Sum → [Reverb] → Soft Clip
-- Real-time synth parameter tweaking
-- BPM clock with play/stop
-- Command bus architecture
-- Event logging for MCP "listening"
+- Mixer with volume, pan, mute/solo
+- Command bus architecture with event logging
 - MCP server with full tool suite
 - Unified TUI+MCP socket bridge (shared state)
 
@@ -102,7 +102,7 @@ gridoxide --mcp
 ### FX View
 | Key | Action |
 |-----|--------|
-| 1-4 | Select track |
+| 1-9,0 | Select track |
 | Up/Down / jk | Select parameter |
 | Left/Right / hl | Adjust value (fine ±5%) |
 | [ / ] | Adjust value (coarse ±20%) |
@@ -112,9 +112,45 @@ gridoxide --mcp
 | R | Toggle master reverb on/off |
 | P | Play/Stop toggle |
 | S | Stop |
-| Tab | Back to Grid view |
+| Tab | Switch to Song view |
 | Esc | Back to Grid view |
 | Q | Quit |
+
+### Song View
+| Key | Action |
+|-----|--------|
+| Up/Down / jk | Navigate arrangement entries |
+| Left/Right / hl | Adjust pattern/repeats |
+| Enter | Append new entry |
+| Delete/Backspace | Remove entry |
+| 0-9 | Quick select pattern slot |
+| M | Toggle pattern/song mode |
+| P | Play/Stop toggle |
+| S | Stop |
+| Tab | Switch to Help view |
+| Esc | Back to Grid view |
+
+### Project Controls (All Views)
+| Key | Action |
+|-----|--------|
+| Ctrl+S | Save project |
+| Ctrl+O | Open project |
+| Ctrl+E | Export WAV (pattern) |
+| Ctrl+W | Export WAV (song) |
+| Shift+L | Open sample browser (sampler tracks) |
+
+### Sampler Parameters
+When using a sampler track, these parameters control playback:
+- **Amplitude**: Output volume (0.0-1.0)
+- **Attack**: Fade-in time (0-50ms)
+- **Decay**: Time to reach sustain level (10-500ms)
+- **Sustain**: Held volume level (0.0-1.0)
+- **Release**: Fade-out time after note-off (10-2000ms)
+- **Start/End Point**: Sample region (0.0-1.0)
+- **Pitch Shift**: Transpose in semitones (-24 to +24)
+- **Loop**: Enable looping playback
+- **Loop Start/End**: Loop region within sample
+- **Hold Steps**: Steps before auto-release (1-16)
 
 ## MCP Tools
 
@@ -162,6 +198,36 @@ When running with `--mcp`, gridoxide exposes these tools. If the TUI is running,
 **Events:**
 - `get_events` - Get recent events (for "listening" to human actions)
 
+**Pattern Bank:**
+- `select_pattern` - Switch active pattern (0-15)
+- `get_pattern_bank` - Overview of all 16 pattern slots
+- `copy_pattern` - Copy pattern from src to dst slot
+- `clear_pattern` - Clear all tracks in a pattern
+
+**Arrangement:**
+- `get_arrangement` - Get full song arrangement
+- `append_arrangement` - Add pattern entry to end
+- `insert_arrangement` - Insert entry at position
+- `remove_arrangement` - Remove entry
+- `set_arrangement_entry` - Modify existing entry
+- `clear_arrangement` - Clear all entries
+- `set_playback_mode` - Switch between "pattern" and "song" mode
+
+**Dynamic Tracks:**
+- `add_track` - Add new track (kick, snare, hihat, bass, sampler)
+- `remove_track` - Remove track by index
+
+**Sampler:**
+- `load_sample` - Load WAV file into sampler track
+- `preview_sample` - Audition sample without loading
+- `list_samples` - List available samples in search directories
+
+**Project I/O:**
+- `save_project` - Save to .grox JSON file
+- `load_project` - Load from .grox file
+- `export_wav` - Render and export audio (pattern or song mode)
+- `list_projects` - List .grox files in directory
+
 ## Themes
 
 - `default` - Uses terminal's ANSI colors
@@ -190,11 +256,14 @@ When the TUI is running, it opens a Unix socket at `/tmp/gridoxide.sock`. The `-
 | 2 | Grid sequencer | Complete |
 | 3 | Sound shaping | Complete |
 | 4 | Mixing | Complete |
-| 4.5 | Per-step notes | **Complete** |
-| 5 | Effects | **Complete** |
-| 6 | Patterns + Arrangement | Planned |
-| 7 | Project I/O | Planned |
-| 8 | MIDI | Planned |
+| 4.5 | Per-step notes | Complete |
+| 5 | Effects | Complete |
+| 6 | Patterns + Arrangement | Complete |
+| 7 | Project I/O | Complete |
+| 8a | Dynamic Tracks | Complete |
+| 8b | Sampler Synth | Complete |
+| 8c | Sampler ADSR + Loop | **Complete** |
+| 8d | Timeline | Planned |
 | 9 | Polish | Planned |
 
 ## License

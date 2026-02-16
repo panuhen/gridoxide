@@ -645,6 +645,10 @@ impl AudioEngine {
 
                     // Check for step trigger
                     if let Some(step) = clock.tick() {
+                        // Notify all synths of step tick (for hold_steps countdown)
+                        for synth in synths.iter_mut() {
+                            synth.step_tick();
+                        }
                         // Trigger synths based on pattern
                         for i in 0..num_synths {
                             let sd = pattern.get_step(i, step);

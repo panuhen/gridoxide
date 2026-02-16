@@ -158,6 +158,10 @@ impl OfflineRenderer {
             if in_content {
                 // Check for step trigger
                 if let Some(step) = self.clock.tick() {
+                    // Notify all synths of step tick (for hold_steps countdown)
+                    for synth in self.synths.iter_mut() {
+                        synth.step_tick();
+                    }
                     let pat = state.pattern_bank.get(current_pattern_idx);
                     for i in 0..num_tracks {
                         let sd = pat.get_step(i, step);
