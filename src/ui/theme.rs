@@ -143,3 +143,26 @@ impl Default for Theme {
         Self::default_theme()
     }
 }
+
+/// Dim a color based on velocity (0-127).
+/// Returns the color interpolated between dim (velocity=0) and full (velocity=127).
+pub fn dim_color_by_velocity(color: Color, velocity: u8) -> Color {
+    // Velocity 127 = full color, 0 = 30% brightness
+    let factor = 0.3 + 0.7 * (velocity as f32 / 127.0);
+
+    match color {
+        Color::Rgb(r, g, b) => {
+            Color::Rgb(
+                (r as f32 * factor) as u8,
+                (g as f32 * factor) as u8,
+                (b as f32 * factor) as u8,
+            )
+        }
+        // For ANSI colors, we can't interpolate, so just use the color as-is
+        // or switch to a dimmed version if velocity is low
+        Color::Green => {
+            if velocity < 64 { Color::DarkGray } else { color }
+        }
+        _ => color,
+    }
+}

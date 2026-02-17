@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::audio::{SequencerState, TrackState};
 use crate::fx::{MasterFxState, TrackFxState};
-use crate::sequencer::{Arrangement, PatternBank, PlaybackMode};
+use crate::sequencer::{Arrangement, PatternBank, PlaybackMode, Variation};
 use crate::synth::{load_wav, BassParams, HiHatParams, KickParams, SnareParams, SynthType};
 
 const PROJECT_VERSION: u32 = 2;
@@ -38,6 +38,8 @@ pub struct ProjectData {
     pub current_pattern: usize,
     pub playback_mode: PlaybackMode,
     pub arrangement: Arrangement,
+    #[serde(default)]
+    pub current_variation: Variation,
 }
 
 /// Sample buffer loaded for a sampler track during project load
@@ -102,6 +104,7 @@ impl ProjectDataV1 {
             current_pattern: self.current_pattern,
             playback_mode: self.playback_mode,
             arrangement: self.arrangement,
+            current_variation: Variation::A,
         }
     }
 }
@@ -134,6 +137,7 @@ impl ProjectData {
             current_pattern: state.current_pattern,
             playback_mode: state.playback_mode,
             arrangement: state.arrangement.clone(),
+            current_variation: state.current_variation,
         }
     }
 
@@ -169,6 +173,7 @@ impl ProjectData {
             arrangement: self.arrangement.clone(),
             arrangement_position: 0,
             arrangement_repeat: 0,
+            current_variation: self.current_variation,
         }
     }
 

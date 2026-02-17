@@ -1,9 +1,9 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders};
 
-use crate::sequencer::{Pattern, PlaybackMode, DEFAULT_TRACKS, STEPS};
+use crate::sequencer::{Pattern, PlaybackMode, Variation, DEFAULT_TRACKS, STEPS};
 use crate::synth::note_name;
-use crate::ui::Theme;
+use crate::ui::{Theme, dim_color_by_velocity};
 
 /// Grid cursor and playhead state
 pub struct GridState {
@@ -167,9 +167,11 @@ pub fn render_grid(
                     )
                 }
             } else if is_active {
+                // Dim color based on velocity
+                let velocity_color = dim_color_by_velocity(theme.grid_active, step_data.velocity);
                 (
                     format!("{:<width$}", note_display, width = display_width as usize),
-                    Style::default().fg(theme.grid_active).bg(theme.bg),
+                    Style::default().fg(velocity_color).bg(theme.bg),
                 )
             } else {
                 // Beat markers (every 4 steps)
@@ -203,8 +205,9 @@ pub struct TransportInfo {
     pub playback_mode: PlaybackMode,
     pub arrangement_position: usize,
     pub arrangement_len: usize,
-    pub cursor_note: Option<(bool, u8)>,
+    pub cursor_note: Option<(bool, u8, u8, u8)>, // (active, note, velocity, probability)
     pub pending_pattern: Option<usize>,
+    pub current_variation: Variation,
 }
 
 /// Render transport status bar
@@ -226,10 +229,15 @@ pub fn render_transport(
         PlaybackMode::Song => "SONG",
     };
 
+    let var_str = match info.current_variation {
+        Variation::A => "A",
+        Variation::B => "B",
+    };
+
     let pat_display = if let Some(pending) = info.pending_pattern {
-        format!("Pat: {:02}>{:02}", info.current_pattern, pending)
+        format!("Pat: {:02}{}>:{:02}", info.current_pattern, var_str, pending)
     } else {
-        format!("Pat: {:02}", info.current_pattern)
+        format!("Pat: {:02}{}", info.current_pattern, var_str)
     };
 
     let mut transport_text = vec![
@@ -265,12 +273,12 @@ pub fn render_transport(
         ));
     }
 
-    // Show note info when cursor is on an active step
-    if let Some((active, note)) = info.cursor_note {
+    // Show note/velocity/probability info when cursor is on an active step
+    if let Some((active, note, velocity, probability)) = info.cursor_note {
         if active {
             transport_text.push(Span::styled(" | ", Style::default().fg(theme.border)));
             transport_text.push(Span::styled(
-                format!("Note: {}", note_name(note)),
+                format!("Note: {} Vel: {} Prob: {}%", note_name(note), velocity, probability),
                 Style::default().fg(theme.highlight),
             ));
         }

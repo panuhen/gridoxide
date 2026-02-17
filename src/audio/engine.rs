@@ -12,7 +12,7 @@ use crate::fx::{
     TrackFxChain, TrackFxState,
 };
 use crate::sequencer::{
-    Arrangement, Clock, Pattern, PatternBank, PlaybackMode, NUM_PATTERNS,
+    Arrangement, Clock, Pattern, PatternBank, PlaybackMode, Variation, NUM_PATTERNS,
 };
 use crate::synth::{
     create_synth, SoundSource, SynthType,
@@ -50,6 +50,8 @@ pub struct SequencerState {
     pub arrangement: Arrangement,
     pub arrangement_position: usize,
     pub arrangement_repeat: usize,
+    // Pattern variation (A/B)
+    pub current_variation: Variation,
 }
 
 impl SequencerState {
@@ -88,6 +90,7 @@ impl SequencerState {
             arrangement: Arrangement::new(),
             arrangement_position: 0,
             arrangement_repeat: 0,
+            current_variation: Variation::A,
         }
     }
 
@@ -177,6 +180,7 @@ impl AudioEngine {
         let mut local_arrangement_position: usize = 0;
         let mut local_arrangement_repeat: usize = 0;
         let mut pending_pattern_switch: Option<usize> = None;
+        let mut local_variation = Variation::A;
 
         // Local mixer state (dynamic)
         let mut local_volumes: Vec<f32> = vec![0.8; num_tracks];
@@ -202,6 +206,15 @@ impl AudioEngine {
         // Preview sample buffer (one-shot playback through master bus)
         let mut preview_buffer: Option<Vec<f32>> = None;
         let mut preview_pos: usize = 0;
+
+        // Simple xorshift PRNG for probability (RT-safe, no heap allocation)
+        let mut prng_state: u32 = 0xDEAD_BEEF;
+        let mut next_prng = move || -> u32 {
+            prng_state ^= prng_state << 13;
+            prng_state ^= prng_state >> 17;
+            prng_state ^= prng_state << 5;
+            prng_state
+        };
 
         // For periodic state sync
         let mut sync_counter = 0usize;
@@ -235,7 +248,8 @@ impl AudioEngine {
                             }
                             // Apply any pending pattern switch immediately on stop
                             if let Some(new_pat) = pending_pattern_switch.take() {
-                                local_pattern_bank.get_mut(local_current_pattern).steps = pattern.steps.clone();
+                                // Copy current pattern back to bank
+                                *local_pattern_bank.get_mut(local_current_pattern) = pattern.clone();
                                 local_current_pattern = new_pat;
                                 pattern = local_pattern_bank.get(new_pat).clone();
                             }
@@ -259,41 +273,61 @@ impl AudioEngine {
                         }
                         Command::ToggleStep { track, step } => {
                             if track < num_synths {
-                                pattern.toggle(track, step);
-                                local_pattern_bank.get_mut(local_current_pattern).toggle(track, step);
+                                pattern.toggle_var(track, step, local_variation);
+                                local_pattern_bank.get_mut(local_current_pattern).toggle_var(track, step, local_variation);
                                 if let Some(mut state) = state.try_write() {
                                     state.pattern = pattern.clone();
-                                    state.pattern_bank.get_mut(local_current_pattern).steps = pattern.steps.clone();
+                                    *state.pattern_bank.get_mut(local_current_pattern) = pattern.clone();
                                 }
                             }
                         }
                         Command::ClearTrack(track) => {
                             if track < num_synths {
-                                pattern.clear_track(track);
-                                local_pattern_bank.get_mut(local_current_pattern).clear_track(track);
+                                pattern.clear_track_var(track, local_variation);
+                                local_pattern_bank.get_mut(local_current_pattern).clear_track_var(track, local_variation);
                                 if let Some(mut state) = state.try_write() {
                                     state.pattern = pattern.clone();
-                                    state.pattern_bank.get_mut(local_current_pattern).steps = pattern.steps.clone();
+                                    *state.pattern_bank.get_mut(local_current_pattern) = pattern.clone();
                                 }
                             }
                         }
                         Command::FillTrack(track) => {
                             if track < num_synths {
-                                pattern.fill_track(track);
-                                local_pattern_bank.get_mut(local_current_pattern).fill_track(track);
+                                pattern.fill_track_var(track, local_variation);
+                                local_pattern_bank.get_mut(local_current_pattern).fill_track_var(track, local_variation);
                                 if let Some(mut state) = state.try_write() {
                                     state.pattern = pattern.clone();
-                                    state.pattern_bank.get_mut(local_current_pattern).steps = pattern.steps.clone();
+                                    *state.pattern_bank.get_mut(local_current_pattern) = pattern.clone();
                                 }
                             }
                         }
                         Command::SetStepNote { track, step, note } => {
                             if track < num_synths {
-                                pattern.set_note(track, step, note);
-                                local_pattern_bank.get_mut(local_current_pattern).set_note(track, step, note);
+                                pattern.set_note_var(track, step, note, local_variation);
+                                local_pattern_bank.get_mut(local_current_pattern).set_note_var(track, step, note, local_variation);
                                 if let Some(mut state) = state.try_write() {
-                                    state.pattern.set_note(track, step, note);
-                                    state.pattern_bank.get_mut(local_current_pattern).set_note(track, step, note);
+                                    state.pattern.set_note_var(track, step, note, local_variation);
+                                    state.pattern_bank.get_mut(local_current_pattern).set_note_var(track, step, note, local_variation);
+                                }
+                            }
+                        }
+                        Command::SetStepVelocity { track, step, velocity } => {
+                            if track < num_synths {
+                                pattern.set_velocity_var(track, step, velocity, local_variation);
+                                local_pattern_bank.get_mut(local_current_pattern).set_velocity_var(track, step, velocity, local_variation);
+                                if let Some(mut state) = state.try_write() {
+                                    state.pattern.set_velocity_var(track, step, velocity, local_variation);
+                                    state.pattern_bank.get_mut(local_current_pattern).set_velocity_var(track, step, velocity, local_variation);
+                                }
+                            }
+                        }
+                        Command::SetStepProbability { track, step, probability } => {
+                            if track < num_synths {
+                                pattern.set_probability_var(track, step, probability, local_variation);
+                                local_pattern_bank.get_mut(local_current_pattern).set_probability_var(track, step, probability, local_variation);
+                                if let Some(mut state) = state.try_write() {
+                                    state.pattern.set_probability_var(track, step, probability, local_variation);
+                                    state.pattern_bank.get_mut(local_current_pattern).set_probability_var(track, step, probability, local_variation);
                                 }
                             }
                         }
@@ -399,7 +433,7 @@ impl AudioEngine {
                         Command::SelectPattern(p) => {
                             if p < NUM_PATTERNS {
                                 // Save current pattern to bank
-                                local_pattern_bank.get_mut(local_current_pattern).steps = pattern.steps.clone();
+                                *local_pattern_bank.get_mut(local_current_pattern) = pattern.clone();
 
                                 if clock.is_playing() {
                                     // Queue for boundary switch
@@ -438,7 +472,9 @@ impl AudioEngine {
                         }
                         Command::ClearPattern(p) => {
                             if p < NUM_PATTERNS {
-                                local_pattern_bank.get_mut(p).clear_all();
+                                // Clear both variations
+                                local_pattern_bank.get_mut(p).clear_all_var(Variation::A);
+                                local_pattern_bank.get_mut(p).clear_all_var(Variation::B);
                                 if p == local_current_pattern {
                                     pattern = local_pattern_bank.get(p).clone();
                                 }
@@ -583,6 +619,31 @@ impl AudioEngine {
                             preview_pos = 0;
                         }
 
+                        // Pattern Variations
+                        Command::SetVariation(v) => {
+                            local_variation = v;
+                            if let Some(mut state) = state.try_write() {
+                                state.current_variation = v;
+                            }
+                        }
+                        Command::ToggleVariation => {
+                            local_variation = match local_variation {
+                                Variation::A => Variation::B,
+                                Variation::B => Variation::A,
+                            };
+                            if let Some(mut state) = state.try_write() {
+                                state.current_variation = local_variation;
+                            }
+                        }
+                        Command::CopyVariation { from, to } => {
+                            pattern.copy_variation(from, to);
+                            local_pattern_bank.get_mut(local_current_pattern).copy_variation(from, to);
+                            if let Some(mut state) = state.try_write() {
+                                state.pattern = pattern.clone();
+                                *state.pattern_bank.get_mut(local_current_pattern) = pattern.clone();
+                            }
+                        }
+
                         Command::LoadProject(new_state) => {
                             // Stop playback
                             clock.stop();
@@ -622,7 +683,7 @@ impl AudioEngine {
                             reverb_enabled = new_state.master_fx.reverb_enabled;
                             local_master_fx = new_state.master_fx.clone();
 
-                            // Restore pattern bank + arrangement
+                            // Restore pattern bank + arrangement + variation
                             local_pattern_bank = new_state.pattern_bank.clone();
                             local_current_pattern = new_state.current_pattern;
                             pattern = local_pattern_bank.get(local_current_pattern).clone();
@@ -630,6 +691,7 @@ impl AudioEngine {
                             local_arrangement = new_state.arrangement.clone();
                             local_arrangement_position = 0;
                             local_arrangement_repeat = 0;
+                            local_variation = new_state.current_variation;
 
                             // Sync shared state
                             if let Some(mut state) = state.try_write() {
@@ -653,11 +715,16 @@ impl AudioEngine {
                         for synth in synths.iter_mut() {
                             synth.step_tick();
                         }
-                        // Trigger synths based on pattern
+                        // Trigger synths based on pattern (with velocity and probability)
                         for i in 0..num_synths {
-                            let sd = pattern.get_step(i, step);
+                            let sd = pattern.get_step_var(i, step, local_variation);
                             if sd.active {
-                                synths[i].trigger_with_note(sd.note);
+                                // Check probability (100 = always trigger)
+                                let should_trigger = sd.probability >= 100
+                                    || (next_prng() % 100) < sd.probability as u32;
+                                if should_trigger {
+                                    synths[i].trigger_with_note_velocity(sd.note, sd.velocity);
+                                }
                             }
                         }
                     }
@@ -668,7 +735,7 @@ impl AudioEngine {
                             PlaybackMode::Pattern => {
                                 // Apply pending pattern switch at boundary
                                 if let Some(new_pat) = pending_pattern_switch.take() {
-                                    local_pattern_bank.get_mut(local_current_pattern).steps = pattern.steps.clone();
+                                    *local_pattern_bank.get_mut(local_current_pattern) = pattern.clone();
                                     local_current_pattern = new_pat;
                                     pattern = local_pattern_bank.get(new_pat).clone();
                                     if let Some(mut state) = state.try_write() {
@@ -689,7 +756,7 @@ impl AudioEngine {
                                             % local_arrangement.len();
                                         // Load new pattern from bank
                                         let new_entry = local_arrangement.entries[local_arrangement_position];
-                                        local_pattern_bank.get_mut(local_current_pattern).steps = pattern.steps.clone();
+                                        *local_pattern_bank.get_mut(local_current_pattern) = pattern.clone();
                                         local_current_pattern = new_entry.pattern;
                                         pattern = local_pattern_bank.get(new_entry.pattern).clone();
                                         if let Some(mut state) = state.try_write() {

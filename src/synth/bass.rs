@@ -14,6 +14,8 @@ pub struct BassSynth {
     params: BassParams,
     /// Active frequency set by trigger_with_note (overrides params.frequency)
     active_frequency: f32,
+    /// Velocity scale (0.0-1.0) for amplitude
+    velocity_scale: f32,
 }
 
 impl BassSynth {
@@ -28,6 +30,7 @@ impl BassSynth {
             sub_phase: 0.0,
             params,
             active_frequency,
+            velocity_scale: 1.0,
         }
     }
 
@@ -54,6 +57,11 @@ impl BassSynth {
         self.osc_phase = 0.0;
         self.sub_phase = 0.0;
         self.active_frequency = midi_to_freq(note);
+    }
+
+    /// Set velocity scale from MIDI velocity (0-127)
+    pub fn set_velocity(&mut self, velocity: u8) {
+        self.velocity_scale = velocity as f32 / 127.0;
     }
 
     pub fn next_sample(&mut self) -> f32 {
@@ -106,7 +114,8 @@ impl BassSynth {
         // Advance phase
         self.phase = Some(phase + 1);
 
-        osc * amp * 0.6
+        // Apply velocity scaling
+        osc * amp * 0.6 * self.velocity_scale
     }
 }
 
@@ -116,6 +125,7 @@ impl SoundSource for BassSynth {
     fn default_note(&self) -> u8 { DEFAULT_NOTES[3] }
     fn trigger(&mut self) { self.trigger(); }
     fn trigger_with_note(&mut self, note: u8) { self.trigger_with_note(note); }
+    fn set_velocity_scale(&mut self, velocity: u8) { self.set_velocity(velocity); }
     fn next_sample(&mut self) -> f32 { self.next_sample() }
 
     fn param_descriptors(&self) -> Vec<ParamDescriptor> {

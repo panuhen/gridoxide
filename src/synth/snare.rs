@@ -14,6 +14,8 @@ pub struct SnareSynth {
     params: SnareParams,
     /// Tone frequency ratio from note (1.0 = default)
     tone_ratio: f32,
+    /// Velocity scale (0.0-1.0) for amplitude
+    velocity_scale: f32,
 }
 
 impl SnareSynth {
@@ -27,6 +29,7 @@ impl SnareSynth {
             tone_phase: 0.0,
             params,
             tone_ratio: 1.0,
+            velocity_scale: 1.0,
         }
     }
 
@@ -51,6 +54,11 @@ impl SnareSynth {
         self.phase = Some(0);
         self.tone_phase = 0.0;
         self.tone_ratio = midi_to_freq(note) / midi_to_freq(DEFAULT_NOTES[1]);
+    }
+
+    /// Set velocity scale from MIDI velocity (0-127)
+    pub fn set_velocity(&mut self, velocity: u8) {
+        self.velocity_scale = velocity as f32 / 127.0;
     }
 
     /// Simple linear congruential generator for noise
@@ -96,7 +104,8 @@ impl SnareSynth {
         let noise_level = 1.0 - self.params.tone_mix;
         let tone_level = self.params.tone_mix;
 
-        (noise * noise_level * 0.6 + tone * tone_level * 0.5) * 0.7
+        // Apply velocity scaling
+        (noise * noise_level * 0.6 + tone * tone_level * 0.5) * 0.7 * self.velocity_scale
     }
 }
 
@@ -106,6 +115,7 @@ impl SoundSource for SnareSynth {
     fn default_note(&self) -> u8 { DEFAULT_NOTES[1] }
     fn trigger(&mut self) { self.trigger(); }
     fn trigger_with_note(&mut self, note: u8) { self.trigger_with_note(note); }
+    fn set_velocity_scale(&mut self, velocity: u8) { self.set_velocity(velocity); }
     fn next_sample(&mut self) -> f32 { self.next_sample() }
 
     fn param_descriptors(&self) -> Vec<ParamDescriptor> {

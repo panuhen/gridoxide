@@ -8,8 +8,11 @@ Gridoxide is a terminal EDM production studio designed for collaborative use bet
 
 When the TUI is running, an MCP socket bridge at `/tmp/gridoxide.sock` allows Claude to control the same session in real time - changes from MCP appear live in the grid.
 
-## Current Status: v0.8.2 (Phase 8c)
+## Current Status: v0.8.3 (Phase 8d)
 
+- **Per-step velocity**: Each step has velocity (0-127) affecting volume/intensity
+- **Per-step probability**: Each step has trigger probability (0-100%)
+- **A/B pattern variations**: Each pattern has two variations that can be toggled/copied
 - **Dynamic tracks**: Add/remove tracks at runtime (kick, snare, hihat, bass, sampler)
 - **Sampler synth**: WAV sample loading with pitch shifting, ADSR envelope, loop mode
 - **ADSR envelope**: Attack, Decay, Sustain level, Release for samplers
@@ -64,6 +67,10 @@ gridoxide --mcp
 | [ | Note down 1 semitone |
 | } (Shift+]) | Note up 1 octave |
 | { (Shift+[) | Note down 1 octave |
+| v / V | Velocity down / up (±16) |
+| b / B | Probability down / up (±10%) |
+| x | Toggle A/B variation |
+| X (Shift+x) | Copy current variation to other |
 | P | Play/Stop toggle |
 | S | Stop (reset to step 0) |
 | +/- | Adjust BPM |
@@ -168,9 +175,11 @@ When running with `--mcp`, gridoxide exposes these tools. If the TUI is running,
 - `clear_track` - Clear a track
 - `fill_track` - Fill a track
 
-**Per-Step Notes:**
+**Per-Step Data:**
 - `set_step_note` - Set MIDI note (0-127) for a step
-- `get_step_notes` - Get all step data for a track including notes
+- `set_step_velocity` - Set velocity (0-127) for a step
+- `set_step_probability` - Set trigger probability (0-100%) for a step
+- `get_step_notes` - Get all step data for a track (notes, velocity, probability)
 
 **Track Parameters:**
 - `list_tracks` - List all tracks with available parameters
@@ -212,6 +221,11 @@ When running with `--mcp`, gridoxide exposes these tools. If the TUI is running,
 - `set_arrangement_entry` - Modify existing entry
 - `clear_arrangement` - Clear all entries
 - `set_playback_mode` - Switch between "pattern" and "song" mode
+
+**Variations:**
+- `set_variation` - Select variation A or B
+- `toggle_variation` - Switch between A and B
+- `copy_variation` - Copy one variation to another
 
 **Dynamic Tracks:**
 - `add_track` - Add new track (kick, snare, hihat, bass, sampler)
@@ -262,8 +276,9 @@ When the TUI is running, it opens a Unix socket at `/tmp/gridoxide.sock`. The `-
 | 7 | Project I/O | Complete |
 | 8a | Dynamic Tracks | Complete |
 | 8b | Sampler Synth | Complete |
-| 8c | Sampler ADSR + Loop | **Complete** |
-| 8d | Timeline | Planned |
+| 8c | Sampler ADSR + Loop | Complete |
+| 8d | Step Data & Variations | **Complete** |
+| 8e | Timeline | Planned |
 | 9 | Polish | Planned |
 
 ## License

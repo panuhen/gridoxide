@@ -26,7 +26,15 @@ pub struct SamplerParams {
     #[serde(default = "default_hold_steps")]
     pub hold_steps: u8,    // 1-16, default 4
     #[serde(default)]
+    pub reverse: bool,     // default false (forward playback)
+    #[serde(default = "default_slice_count")]
+    pub slice_count: u8,   // 1-16, default 1 (no slicing)
+    #[serde(default)]
     pub wav_path: Option<String>, // for display and serialization
+}
+
+fn default_slice_count() -> u8 {
+    1
 }
 
 fn default_loop_end() -> f32 {
@@ -52,6 +60,8 @@ impl Default for SamplerParams {
             loop_start: 0.0,
             loop_end: 1.0,
             hold_steps: 4,
+            reverse: false,
+            slice_count: 1,
             wav_path: None,
         }
     }
@@ -79,6 +89,12 @@ pub struct SamplerSynth {
     trigger_step: Option<usize>, // step when note was triggered (for hold_steps)
     steps_elapsed: usize,        // steps elapsed since trigger
     params: SamplerParams,
+    /// Velocity scale (0.0-1.0) for amplitude
+    velocity_scale: f32,
+    /// Active slice start (fraction of buffer, computed at trigger time)
+    active_slice_start: f64,
+    /// Active slice end (fraction of buffer, computed at trigger time)
+    active_slice_end: f64,
 }
 
 impl SamplerSynth {
@@ -95,7 +111,15 @@ impl SamplerSynth {
             trigger_step: None,
             steps_elapsed: 0,
             params: SamplerParams::default(),
+            velocity_scale: 1.0,
+            active_slice_start: 0.0,
+            active_slice_end: 1.0,
         }
+    }
+
+    /// Set velocity scale from MIDI velocity (0-127)
+    pub fn set_velocity(&mut self, velocity: u8) {
+        self.velocity_scale = velocity as f32 / 127.0;
     }
 
     /// Load a sample buffer and associated path
@@ -159,14 +183,53 @@ impl SoundSource for SamplerSynth {
         self.trigger_with_note(60);
     }
 
+    fn set_velocity_scale(&mut self, velocity: u8) {
+        self.set_velocity(velocity);
+    }
+
     fn trigger_with_note(&mut self, note: u8) {
         if self.buffer.is_empty() {
             return;
         }
+
+        // Calculate slice region if slice_count > 1
+        let slice_count = self.params.slice_count.max(1) as usize;
+        if slice_count > 1 {
+            // Note determines which slice to play
+            let slice_idx = (note as usize) % slice_count;
+            let slice_size = 1.0 / slice_count as f64;
+            self.active_slice_start = slice_idx as f64 * slice_size;
+            self.active_slice_end = (slice_idx + 1) as f64 * slice_size;
+        } else {
+            // No slicing: use full start/end points
+            self.active_slice_start = self.params.start_point as f64;
+            self.active_slice_end = self.params.end_point as f64;
+        }
+
         // Compute playback rate: 2^((note - 60 + pitch_shift) / 12)
-        let semitones = (note as f64 - 60.0) + self.params.pitch_shift as f64;
-        self.playback_rate = 2.0f64.powf(semitones / 12.0);
-        self.position = Some(self.start_pos_samples());
+        // When slicing, the note selects the slice but doesn't change pitch
+        let semitones = if slice_count > 1 {
+            // Slicing mode: pitch_shift only (note doesn't affect pitch)
+            self.params.pitch_shift as f64
+        } else {
+            // Normal mode: note + pitch_shift
+            (note as f64 - 60.0) + self.params.pitch_shift as f64
+        };
+        let rate = 2.0f64.powf(semitones / 12.0);
+        // Negate rate for reverse playback
+        self.playback_rate = if self.params.reverse { -rate } else { rate };
+
+        // Calculate start position in samples
+        let start_samples = self.active_slice_start * self.buffer.len() as f64;
+        let end_samples = self.active_slice_end * self.buffer.len() as f64;
+
+        // Start at end for reverse, start for forward
+        self.position = Some(if self.params.reverse {
+            // Start just before end so we read valid samples
+            (end_samples - 1.0).max(0.0)
+        } else {
+            start_samples
+        });
         self.envelope = 0.0;
         self.envelope_samples = 0;
         self.release_start_level = 0.0;
@@ -196,17 +259,33 @@ impl SoundSource for SamplerSynth {
             return 0.0;
         }
 
-        let end = self.end_pos_samples();
+        // Use active slice region (computed at trigger time)
+        let start = self.active_slice_start * self.buffer.len() as f64;
+        let end = self.active_slice_end * self.buffer.len() as f64;
+        let is_reverse = self.params.reverse;
 
         // Check if we've reached end of playback region
-        let new_pos = if pos >= end || pos >= self.buffer.len() as f64 {
+        // Forward: pos >= end, Reverse: pos < start
+        let out_of_bounds = if is_reverse {
+            pos < start || pos < 0.0
+        } else {
+            pos >= end || pos >= self.buffer.len() as f64
+        };
+
+        let new_pos = if out_of_bounds {
             if self.params.loop_enabled && self.envelope_phase != EnvelopePhase::Release {
-                // Loop mode: wrap back to loop_start
+                // Loop mode: wrap back
                 let loop_start = self.loop_start_samples();
                 let loop_end = self.loop_end_samples().min(self.buffer.len() as f64);
                 if loop_end > loop_start {
-                    // Wrap within loop region
-                    loop_start + ((pos - loop_start) % (loop_end - loop_start))
+                    let loop_len = loop_end - loop_start;
+                    if is_reverse {
+                        // Wrap from loop_start back to loop_end
+                        loop_end - ((loop_start - pos) % loop_len) - 1.0
+                    } else {
+                        // Wrap from loop_end back to loop_start
+                        loop_start + ((pos - loop_start) % loop_len)
+                    }
                 } else {
                     // Invalid loop region, stop
                     self.position = None;
@@ -239,12 +318,21 @@ impl SoundSource for SamplerSynth {
         let raw = s0 + (s1 - s0) * frac;
 
         // Advance position (with loop wrapping)
-        let next_pos = new_pos + self.playback_rate;
+        let next_pos = new_pos + self.playback_rate; // playback_rate is negative for reverse
         if self.params.loop_enabled && self.envelope_phase != EnvelopePhase::Release {
             let loop_start = self.loop_start_samples();
             let loop_end = self.loop_end_samples().min(self.buffer.len() as f64);
-            if loop_end > loop_start && next_pos >= loop_end {
-                self.position = Some(loop_start + ((next_pos - loop_start) % (loop_end - loop_start)));
+            if loop_end > loop_start {
+                let loop_len = loop_end - loop_start;
+                if is_reverse && next_pos < loop_start {
+                    // Wrap back to loop_end for reverse
+                    self.position = Some(loop_end - ((loop_start - next_pos) % loop_len) - 1.0);
+                } else if !is_reverse && next_pos >= loop_end {
+                    // Wrap back to loop_start for forward
+                    self.position = Some(loop_start + ((next_pos - loop_start) % loop_len));
+                } else {
+                    self.position = Some(next_pos);
+                }
             } else {
                 self.position = Some(next_pos);
             }
@@ -294,10 +382,16 @@ impl SoundSource for SamplerSynth {
                 // Hold at sustain level
                 // For one-shot (non-looping), auto-trigger release when near end
                 if !self.params.loop_enabled {
-                    let end = self.end_pos_samples();
-                    let release_time_samples = self.release_samples() as f64 * self.playback_rate;
+                    let release_time_samples = self.release_samples() as f64 * self.playback_rate.abs();
                     if let Some(p) = self.position {
-                        if p + release_time_samples >= end {
+                        let should_release = if is_reverse {
+                            // For reverse, check if we're near start_point
+                            p - release_time_samples <= start
+                        } else {
+                            // For forward, check if we're near end_point
+                            p + release_time_samples >= end
+                        };
+                        if should_release {
                             self.start_release();
                         }
                     }
@@ -324,7 +418,8 @@ impl SoundSource for SamplerSynth {
             }
         }
 
-        raw * self.envelope * self.params.amplitude
+        // Apply velocity scaling
+        raw * self.envelope * self.params.amplitude * self.velocity_scale
     }
 
     fn param_descriptors(&self) -> Vec<ParamDescriptor> {
@@ -413,6 +508,20 @@ impl SoundSource for SamplerSynth {
                 max: 16.0,
                 default: 4.0,
             },
+            ParamDescriptor {
+                key: "reverse".into(),
+                name: "Reverse".into(),
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+            },
+            ParamDescriptor {
+                key: "slice_count".into(),
+                name: "Slice Count".into(),
+                min: 1.0,
+                max: 16.0,
+                default: 1.0,
+            },
         ]
     }
 
@@ -430,6 +539,8 @@ impl SoundSource for SamplerSynth {
             "loop_start" => Some(self.params.loop_start),
             "loop_end" => Some(self.params.loop_end),
             "hold_steps" => Some(self.params.hold_steps as f32),
+            "reverse" => Some(if self.params.reverse { 1.0 } else { 0.0 }),
+            "slice_count" => Some(self.params.slice_count as f32),
             _ => None,
         }
     }
@@ -482,6 +593,14 @@ impl SoundSource for SamplerSynth {
             }
             "hold_steps" => {
                 self.params.hold_steps = (value.clamp(1.0, 16.0) as u8).max(1);
+                true
+            }
+            "reverse" => {
+                self.params.reverse = value >= 0.5;
+                true
+            }
+            "slice_count" => {
+                self.params.slice_count = (value.clamp(1.0, 16.0) as u8).max(1);
                 true
             }
             _ => false,

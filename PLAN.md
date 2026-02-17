@@ -48,8 +48,9 @@ Core principle: **full parity between TUI and MCP** via unified command bus. Eve
 | 8a | Dynamic Tracks | SoundSource trait, dynamic track count, Help view | **COMPLETE** |
 | 8b | Sampler Synth | WAV sample loading, pitch shifting, per-step playback, sample browser | **COMPLETE** |
 | 8c | Sampler ADSR + Loop | ADSR envelope, loop mode, hold_steps for sustained playback | **COMPLETE** |
-| 8d | Timeline | Horizontal timeline, per-track arrangement, variable step resolution | Planned |
-| 9 | Polish | Velocity/probability, undo/redo, more engines | Planned |
+| 8d | Step Data & Variations | Per-step velocity/probability, A/B pattern variations | **COMPLETE** |
+| 8e | Timeline | Horizontal timeline, per-track arrangement, variable step resolution | Planned |
+| 9 | Polish | Undo/redo, more engines, UI refinements | Planned |
 
 ---
 

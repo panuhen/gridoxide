@@ -14,4 +14,4 @@ pub use help::{render_help, HelpState};
 pub use mixer::{render_mixer, MixerField, MixerState};
 pub use params::{get_param_descriptors, get_snapshot_param_value, render_params, ParamEditorState};
 pub use song::{render_song, SongState};
-pub use theme::Theme;
+pub use theme::{Theme, dim_color_by_velocity};

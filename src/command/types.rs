@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio::SequencerState;
 use crate::fx::{FilterType, FxParamId, FxType, MasterFxParamId};
-use crate::sequencer::PlaybackMode;
+use crate::sequencer::{PlaybackMode, Variation};
 use crate::synth::SynthType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,8 +24,10 @@ pub enum Command {
     ClearTrack(usize),
     FillTrack(usize),
 
-    // Per-step note
+    // Per-step note, velocity, probability
     SetStepNote { track: usize, step: usize, note: u8 },
+    SetStepVelocity { track: usize, step: usize, velocity: u8 },
+    SetStepProbability { track: usize, step: usize, probability: u8 },
 
     // Dynamic track parameter (replaces old SetKickParams/SetSnareParams/etc.)
     SetTrackParam { track: usize, key: String, value: f32 },
@@ -64,6 +66,11 @@ pub enum Command {
     SetArrangementEntry { position: usize, pattern: usize, repeats: usize },
     ClearArrangement,
 
+    // Pattern Variations
+    SetVariation(Variation),
+    ToggleVariation,
+    CopyVariation { from: Variation, to: Variation },
+
     // Project I/O
     #[serde(skip)]
     LoadProject(Box<SequencerState>),
@@ -98,6 +105,12 @@ impl Command {
             Command::FillTrack(track) => format!("Fill track {}", track),
             Command::SetStepNote { track, step, note } => {
                 format!("Set track {} step {} note to {}", track, step, note)
+            }
+            Command::SetStepVelocity { track, step, velocity } => {
+                format!("Set track {} step {} velocity to {}", track, step, velocity)
+            }
+            Command::SetStepProbability { track, step, probability } => {
+                format!("Set track {} step {} probability to {}%", track, step, probability)
             }
             Command::SetTrackParam { track, key, value } => {
                 format!("Set track {} param {} to {:.2}", track, key, value)
@@ -166,6 +179,25 @@ impl Command {
                 )
             }
             Command::ClearArrangement => "Clear arrangement".to_string(),
+            Command::SetVariation(v) => {
+                let name = match v {
+                    Variation::A => "A",
+                    Variation::B => "B",
+                };
+                format!("Set variation to {}", name)
+            }
+            Command::ToggleVariation => "Toggle variation A/B".to_string(),
+            Command::CopyVariation { from, to } => {
+                let from_name = match from {
+                    Variation::A => "A",
+                    Variation::B => "B",
+                };
+                let to_name = match to {
+                    Variation::A => "A",
+                    Variation::B => "B",
+                };
+                format!("Copy variation {} to {}", from_name, to_name)
+            }
             Command::LoadProject(_) => "Load project".to_string(),
             Command::LoadSample { track, ref path, .. } => {
                 format!("Load sample '{}' into track {}", path, track)

@@ -11,7 +11,7 @@ use crate::fx::{FilterType, FxParamId, FxType, MasterFxParamId};
 use crate::project;
 use crate::project::renderer::{ExportMode, export_wav};
 use crate::samples;
-use crate::sequencer::{PlaybackMode, NUM_PATTERNS};
+use crate::sequencer::{PlaybackMode, Variation, NUM_PATTERNS};
 use crate::synth::{create_synth, load_wav, note_name, ParamDescriptor, SynthType};
 
 /// MCP server handler for gridoxide
@@ -104,6 +104,10 @@ impl GridoxideMcp {
             PlaybackMode::Pattern => "pattern",
             PlaybackMode::Song => "song",
         };
+        let var_str = match state.current_variation {
+            Variation::A => "A",
+            Variation::B => "B",
+        };
         json!({
             "playing": state.playing,
             "bpm": state.bpm,
@@ -112,7 +116,8 @@ impl GridoxideMcp {
             "playback_mode": mode_str,
             "arrangement_position": state.arrangement_position,
             "arrangement_repeat": state.arrangement_repeat,
-            "num_tracks": state.tracks.len()
+            "num_tracks": state.tracks.len(),
+            "current_variation": var_str
         })
     }
 
@@ -225,7 +230,9 @@ impl GridoxideMcp {
                     "step": step,
                     "active": sd.active,
                     "note": sd.note,
-                    "note_name": note_name(sd.note)
+                    "note_name": note_name(sd.note),
+                    "velocity": sd.velocity,
+                    "probability": sd.probability
                 })
             })
             .collect();
@@ -235,6 +242,46 @@ impl GridoxideMcp {
             "name": track_name,
             "default_note": default_note,
             "steps": steps
+        })
+    }
+
+    pub fn set_step_velocity(&self, track: usize, step: usize, velocity: u8) -> Value {
+        if let Some(err) = self.validate_track(track) {
+            return err;
+        }
+        if step >= 16 {
+            return json!({ "status": "error", "message": "Step must be 0-15" });
+        }
+        let clamped = velocity.min(127);
+        self.dispatch(Command::SetStepVelocity { track, step, velocity: clamped });
+
+        let track_name = self.track_name(track);
+        json!({
+            "status": "ok",
+            "track": track,
+            "track_name": track_name,
+            "step": step,
+            "velocity": clamped
+        })
+    }
+
+    pub fn set_step_probability(&self, track: usize, step: usize, probability: u8) -> Value {
+        if let Some(err) = self.validate_track(track) {
+            return err;
+        }
+        if step >= 16 {
+            return json!({ "status": "error", "message": "Step must be 0-15" });
+        }
+        let clamped = probability.min(100);
+        self.dispatch(Command::SetStepProbability { track, step, probability: clamped });
+
+        let track_name = self.track_name(track);
+        json!({
+            "status": "ok",
+            "track": track,
+            "track_name": track_name,
+            "step": step,
+            "probability": clamped
         })
     }
 
@@ -958,6 +1005,76 @@ impl GridoxideMcp {
         })
     }
 
+    // === Pattern Variation Tools ===
+
+    pub fn set_variation(&self, variation: &str) -> Value {
+        let var = match variation.to_uppercase().as_str() {
+            "A" => Variation::A,
+            "B" => Variation::B,
+            _ => {
+                return json!({
+                    "status": "error",
+                    "message": "Variation must be 'A' or 'B'"
+                });
+            }
+        };
+        self.dispatch(Command::SetVariation(var));
+        json!({
+            "status": "ok",
+            "message": format!("Set variation to {}", variation.to_uppercase())
+        })
+    }
+
+    pub fn toggle_variation(&self) -> Value {
+        self.dispatch(Command::ToggleVariation);
+        let new_var = {
+            let state = self.sequencer_state.read();
+            match state.current_variation {
+                Variation::A => "A",
+                Variation::B => "B",
+            }
+        };
+        json!({
+            "status": "ok",
+            "message": format!("Toggled to variation {}", new_var),
+            "current_variation": new_var
+        })
+    }
+
+    pub fn copy_variation(&self, from: &str, to: &str) -> Value {
+        let from_var = match from.to_uppercase().as_str() {
+            "A" => Variation::A,
+            "B" => Variation::B,
+            _ => {
+                return json!({
+                    "status": "error",
+                    "message": "From variation must be 'A' or 'B'"
+                });
+            }
+        };
+        let to_var = match to.to_uppercase().as_str() {
+            "A" => Variation::A,
+            "B" => Variation::B,
+            _ => {
+                return json!({
+                    "status": "error",
+                    "message": "To variation must be 'A' or 'B'"
+                });
+            }
+        };
+        if from_var == to_var {
+            return json!({
+                "status": "ok",
+                "message": "Source and destination are the same, nothing to copy"
+            });
+        }
+        self.dispatch(Command::CopyVariation { from: from_var, to: to_var });
+        json!({
+            "status": "ok",
+            "message": format!("Copied variation {} to {}", from.to_uppercase(), to.to_uppercase())
+        })
+    }
+
     // === Project I/O Tools ===
 
     pub fn save_project(&self, path_str: &str) -> Value {
@@ -1240,6 +1357,18 @@ impl GridoxideMcp {
                 let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 self.get_step_notes(track)
             }
+            "set_step_velocity" => {
+                let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let step = args.get("step").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let velocity = args.get("velocity").and_then(|v| v.as_u64()).unwrap_or(127) as u8;
+                self.set_step_velocity(track, step, velocity)
+            }
+            "set_step_probability" => {
+                let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let step = args.get("step").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let probability = args.get("probability").and_then(|v| v.as_u64()).unwrap_or(100) as u8;
+                self.set_step_probability(track, step, probability)
+            }
             "clear_track" => {
                 let track = args.get("track").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 self.clear_track(track)
@@ -1379,6 +1508,18 @@ impl GridoxideMcp {
             }
             "clear_arrangement" => self.clear_arrangement(),
 
+            // Pattern Variations
+            "set_variation" => {
+                let variation = args.get("variation").and_then(|v| v.as_str()).unwrap_or("A");
+                self.set_variation(variation)
+            }
+            "toggle_variation" => self.toggle_variation(),
+            "copy_variation" => {
+                let from = args.get("from").and_then(|v| v.as_str()).unwrap_or("A");
+                let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("B");
+                self.copy_variation(from, to)
+            }
+
             // Project I/O
             "save_project" => {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("project.grox");
@@ -1487,11 +1628,37 @@ impl GridoxideMcp {
                 },
                 {
                     "name": "get_step_notes",
-                    "description": "Get all step data for a track including notes. Shows active state and MIDI note for each of the 16 steps.",
+                    "description": "Get all step data for a track including notes, velocity, and probability. Shows data for each of the 16 steps.",
                     "inputSchema": {
                         "type": "object",
                         "properties": { "track": { "type": "integer", "description": "Track index (0-based)" } },
                         "required": ["track"]
+                    }
+                },
+                {
+                    "name": "set_step_velocity",
+                    "description": "Set the velocity for a step. Velocity affects the volume/intensity of the triggered sound (0=silent, 127=full).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "track": { "type": "integer", "description": "Track index (0-based)" },
+                            "step": { "type": "integer", "description": "Step index (0-15)" },
+                            "velocity": { "type": "integer", "description": "MIDI velocity (0-127). 127=full volume, 64=half, 0=silent." }
+                        },
+                        "required": ["track", "step", "velocity"]
+                    }
+                },
+                {
+                    "name": "set_step_probability",
+                    "description": "Set the trigger probability for a step. The step will randomly trigger based on this percentage.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "track": { "type": "integer", "description": "Track index (0-based)" },
+                            "step": { "type": "integer", "description": "Step index (0-15)" },
+                            "probability": { "type": "integer", "description": "Trigger probability (0-100%). 100=always, 50=half the time, 0=never." }
+                        },
+                        "required": ["track", "step", "probability"]
                     }
                 },
                 {
@@ -1792,6 +1959,34 @@ impl GridoxideMcp {
                     "name": "clear_arrangement",
                     "description": "Remove all entries from the arrangement.",
                     "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
+                    "name": "set_variation",
+                    "description": "Set the current pattern variation ('A' or 'B'). Each pattern has two variations that can be programmed independently.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "variation": { "type": "string", "description": "Variation to select: 'A' or 'B'" }
+                        },
+                        "required": ["variation"]
+                    }
+                },
+                {
+                    "name": "toggle_variation",
+                    "description": "Toggle between pattern variation A and B.",
+                    "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
+                    "name": "copy_variation",
+                    "description": "Copy one variation to another within the current pattern.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "from": { "type": "string", "description": "Source variation: 'A' or 'B'" },
+                            "to": { "type": "string", "description": "Destination variation: 'A' or 'B'" }
+                        },
+                        "required": ["from", "to"]
+                    }
                 },
                 {
                     "name": "save_project",

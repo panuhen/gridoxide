@@ -17,6 +17,8 @@ pub struct KickSynth {
     params: KickParams,
     /// Pitch ratio from note (1.0 = default pitch)
     pitch_ratio: f32,
+    /// Velocity scale (0.0-1.0) for amplitude
+    velocity_scale: f32,
 }
 
 impl KickSynth {
@@ -31,6 +33,7 @@ impl KickSynth {
             osc_phase: 0.0,
             params,
             pitch_ratio: 1.0,
+            velocity_scale: 1.0,
         }
     }
 
@@ -59,6 +62,11 @@ impl KickSynth {
         self.sample_index = Some(0);
         self.osc_phase = 0.0;
         self.pitch_ratio = midi_to_freq(note) / midi_to_freq(DEFAULT_NOTES[0]);
+    }
+
+    /// Set velocity scale from MIDI velocity (0-127)
+    pub fn set_velocity(&mut self, velocity: u8) {
+        self.velocity_scale = velocity as f32 / 127.0;
     }
 
     /// Generate the next sample
@@ -111,7 +119,8 @@ impl KickSynth {
             sample = (sample * drive_amount).tanh() / drive_amount.tanh();
         }
 
-        sample
+        // Apply velocity scaling
+        sample * self.velocity_scale
     }
 }
 
@@ -121,6 +130,7 @@ impl SoundSource for KickSynth {
     fn default_note(&self) -> u8 { DEFAULT_NOTES[0] }
     fn trigger(&mut self) { self.trigger(); }
     fn trigger_with_note(&mut self, note: u8) { self.trigger_with_note(note); }
+    fn set_velocity_scale(&mut self, velocity: u8) { self.set_velocity(velocity); }
     fn next_sample(&mut self) -> f32 { self.next_sample() }
 
     fn param_descriptors(&self) -> Vec<ParamDescriptor> {

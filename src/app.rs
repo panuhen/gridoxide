@@ -23,7 +23,7 @@ use crate::mcp::{start_socket_server, GridoxideMcp};
 use crate::project;
 use crate::project::renderer::{ExportMode, export_wav};
 use crate::samples;
-use crate::sequencer::{PlaybackMode, NUM_PATTERNS};
+use crate::sequencer::{PlaybackMode, Variation, NUM_PATTERNS};
 use crate::synth::{load_wav, SynthType};
 use crate::ui::{
     get_param_descriptors, get_snapshot_param_value, render_browser, render_fx, render_grid,
@@ -266,7 +266,7 @@ impl App {
         }
 
         match self.view {
-            View::Grid => self.handle_grid_key(key.code),
+            View::Grid => self.handle_grid_key(key),
             View::Params => self.handle_params_key(key.code),
             View::Mixer => self.handle_mixer_key(key.code),
             View::Fx => self.handle_fx_key(key.code),
@@ -422,9 +422,41 @@ impl App {
     }
 
     /// Handle keys in grid view
-    fn handle_grid_key(&mut self, key: KeyCode) {
+    fn handle_grid_key(&mut self, key: KeyEvent) {
         let num_tracks = self.num_tracks();
-        match key {
+        let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        // Handle velocity/probability adjustments with modifiers
+        if has_shift && !has_ctrl {
+            match key.code {
+                KeyCode::Up => {
+                    self.adjust_step_velocity(10);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.adjust_step_velocity(-10);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if has_ctrl && !has_shift {
+            match key.code {
+                KeyCode::Up => {
+                    self.adjust_step_probability(10);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.adjust_step_probability(-10);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        match key.code {
             // Quit
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.should_quit = true;
@@ -475,6 +507,22 @@ impl App {
                 self.grid_state.move_cursor(0, 1, num_tracks);
             }
 
+            // Velocity adjust with 'v' and 'V'
+            KeyCode::Char('v') => {
+                self.adjust_step_velocity(-10);
+            }
+            KeyCode::Char('V') => {
+                self.adjust_step_velocity(10);
+            }
+
+            // Probability adjust with 'r' and 'R' (for "random")
+            KeyCode::Char('r') => {
+                self.adjust_step_probability(-10);
+            }
+            KeyCode::Char('R') => {
+                self.adjust_step_probability(10);
+            }
+
             // BPM control
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 let current_bpm = self.sequencer_state.read().bpm;
@@ -522,6 +570,21 @@ impl App {
                 let current = self.sequencer_state.read().current_pattern;
                 let new_pat = (current + 1) % NUM_PATTERNS;
                 self.dispatch(Command::SelectPattern(new_pat));
+            }
+
+            // Toggle variation A/B
+            KeyCode::Char('x') => {
+                self.dispatch(Command::ToggleVariation);
+            }
+            // Copy current variation to other (Shift+X)
+            KeyCode::Char('X') => {
+                let current_var = self.sequencer_state.read().current_variation;
+                let (from, to) = match current_var {
+                    Variation::A => (Variation::A, Variation::B),
+                    Variation::B => (Variation::B, Variation::A),
+                };
+                self.dispatch(Command::CopyVariation { from, to });
+                self.set_status(format!("Copied variation {:?} to {:?}", from, to));
             }
 
             // Open sample browser for sampler tracks (Shift+L)
@@ -1196,6 +1259,48 @@ impl App {
         });
     }
 
+    /// Adjust the velocity of the current step in grid view
+    fn adjust_step_velocity(&mut self, delta: i32) {
+        let track = self.grid_state.cursor_track;
+        let step = self.grid_state.cursor_step;
+        let state = self.sequencer_state.read();
+        let step_data = state.pattern.get_step(track, step);
+        drop(state);
+
+        // Only adjust velocity on active steps
+        if !step_data.active {
+            return;
+        }
+
+        let new_velocity = (step_data.velocity as i32 + delta).clamp(0, 127) as u8;
+        self.dispatch(Command::SetStepVelocity {
+            track,
+            step,
+            velocity: new_velocity,
+        });
+    }
+
+    /// Adjust the probability of the current step in grid view
+    fn adjust_step_probability(&mut self, delta: i32) {
+        let track = self.grid_state.cursor_track;
+        let step = self.grid_state.cursor_step;
+        let state = self.sequencer_state.read();
+        let step_data = state.pattern.get_step(track, step);
+        drop(state);
+
+        // Only adjust probability on active steps
+        if !step_data.active {
+            return;
+        }
+
+        let new_probability = (step_data.probability as i32 + delta).clamp(0, 100) as u8;
+        self.dispatch(Command::SetStepProbability {
+            track,
+            step,
+            probability: new_probability,
+        });
+    }
+
     /// Adjust the currently selected parameter (uses string-key system)
     fn adjust_current_param(&mut self, delta_normalized: f32) {
         let track = self.param_editor.track;
@@ -1246,12 +1351,13 @@ impl App {
         self.render_header(frame, chunks[0]);
         // Get cursor note info for transport display
         let cursor_note = {
-            let step_data = state.pattern.get_step(
+            let step_data = state.pattern.get_step_var(
                 self.grid_state.cursor_track,
                 self.grid_state.cursor_step,
+                state.current_variation,
             );
             if self.view == View::Grid {
-                Some((step_data.active, step_data.note))
+                Some((step_data.active, step_data.note, step_data.velocity, step_data.probability))
             } else {
                 None
             }
@@ -1266,6 +1372,7 @@ impl App {
             arrangement_len: state.arrangement.len(),
             cursor_note,
             pending_pattern: None,
+            current_variation: state.current_variation,
         };
         render_transport(
             frame,

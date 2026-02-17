@@ -78,6 +78,18 @@ pub trait SoundSource: Send {
     /// Trigger with a specific MIDI note
     fn trigger_with_note(&mut self, note: u8);
 
+    /// Trigger with a specific MIDI note and velocity (0-127)
+    /// Default implementation ignores velocity and calls trigger_with_note
+    fn trigger_with_note_velocity(&mut self, note: u8, velocity: u8) {
+        self.set_velocity_scale(velocity);
+        self.trigger_with_note(note);
+    }
+
+    /// Set velocity scale (0-127 mapped to 0.0-1.0) for next sample generation
+    fn set_velocity_scale(&mut self, _velocity: u8) {
+        // Default: ignore velocity
+    }
+
     /// Generate the next audio sample
     fn next_sample(&mut self) -> f32;
 

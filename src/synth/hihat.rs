@@ -14,6 +14,8 @@ pub struct HiHatSynth {
     params: HiHatParams,
     /// Brightness ratio from note (1.0 = default)
     brightness_ratio: f32,
+    /// Velocity scale (0.0-1.0) for amplitude
+    velocity_scale: f32,
 }
 
 impl HiHatSynth {
@@ -27,6 +29,7 @@ impl HiHatSynth {
             filter_state: 0.0,
             params,
             brightness_ratio: 1.0,
+            velocity_scale: 1.0,
         }
     }
 
@@ -63,6 +66,11 @@ impl HiHatSynth {
         let base_duration = if self.params.open > 0.5 { 0.2 } else { 0.05 };
         let open_factor = 1.0 + self.params.open * 3.0;
         self.duration_samples = (self.sample_rate * base_duration * open_factor) as usize;
+    }
+
+    /// Set velocity scale from MIDI velocity (0-127)
+    pub fn set_velocity(&mut self, velocity: u8) {
+        self.velocity_scale = velocity as f32 / 127.0;
     }
 
     /// Simple linear congruential generator for noise
@@ -102,7 +110,8 @@ impl HiHatSynth {
         // Advance phase
         self.phase = Some(phase + 1);
 
-        filtered * amp * 0.4
+        // Apply velocity scaling
+        filtered * amp * 0.4 * self.velocity_scale
     }
 }
 
@@ -112,6 +121,7 @@ impl SoundSource for HiHatSynth {
     fn default_note(&self) -> u8 { DEFAULT_NOTES[2] }
     fn trigger(&mut self) { self.trigger(); }
     fn trigger_with_note(&mut self, note: u8) { self.trigger_with_note(note); }
+    fn set_velocity_scale(&mut self, velocity: u8) { self.set_velocity(velocity); }
     fn next_sample(&mut self) -> f32 { self.next_sample() }
 
     fn param_descriptors(&self) -> Vec<ParamDescriptor> {

@@ -36,6 +36,7 @@ struct OfflineRenderer {
     pans: Vec<f32>,
     mutes: Vec<bool>,
     solos: Vec<bool>,
+    prng_state: u32,
 }
 
 impl OfflineRenderer {
@@ -97,7 +98,16 @@ impl OfflineRenderer {
             pans,
             mutes,
             solos,
+            prng_state: 0xDEAD_BEEF,
         }
+    }
+
+    /// Simple xorshift PRNG for probability
+    fn next_prng(&mut self) -> u32 {
+        self.prng_state ^= self.prng_state << 13;
+        self.prng_state ^= self.prng_state >> 17;
+        self.prng_state ^= self.prng_state << 5;
+        self.prng_state
     }
 
     /// Render a fixed number of samples, using the given pattern for triggering
@@ -163,10 +173,17 @@ impl OfflineRenderer {
                         synth.step_tick();
                     }
                     let pat = state.pattern_bank.get(current_pattern_idx);
+                    // Use the current variation from the state
+                    let variation = state.current_variation;
                     for i in 0..num_tracks {
-                        let sd = pat.get_step(i, step);
+                        let sd = pat.get_step_var(i, step, variation);
                         if sd.active {
-                            self.synths[i].trigger_with_note(sd.note);
+                            // Check probability (100 = always trigger)
+                            let should_trigger = sd.probability >= 100
+                                || (self.next_prng() % 100) < sd.probability as u32;
+                            if should_trigger {
+                                self.synths[i].trigger_with_note_velocity(sd.note, sd.velocity);
+                            }
                         }
                     }
                 }
